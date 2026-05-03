@@ -3,14 +3,14 @@ ENTRY(_start)
 
 MEMORY
 {
-    RAM (rwx) : ORIGIN = 0x80000000, LENGTH = 512K
+    RAM (rwx) : ORIGIN = 0x80080000, LENGTH = 512K
 }
 
 SECTIONS
 {
     . = ORIGIN(RAM);
 
-    .text ALIGN(8) : {
+    .text ALIGN(0x8) : {
         *(.text._start)
         *(.text .text.*)
     } > RAM
@@ -27,7 +27,6 @@ SECTIONS
         __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
-        __tls_get_addr = .;
         __bss_end = .;
     } > RAM
 

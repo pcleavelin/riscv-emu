@@ -39,6 +39,7 @@ imm[11:0]           rs1 000 rd 0011011 ADDIW
 0000000       shamt rs1 001 rd 0011011 SLLIW
 0000000       shamt rs1 101 rd 0011011 SRLIW
 0100000       shamt rs1 101 rd 0011011 SRAIW
+
 0000000         rs2 rs1 000 rd 0111011 ADDW
 0100000         rs2 rs1 000 rd 0111011 SUBW
 0000000         rs2 rs1 001 rd 0111011 SLLW
@@ -62,8 +63,7 @@ imm[12|10:5]          rs2 rs1 111 imm[4:1|11] 1100011 BGEU
 imm[11:5]                rs2 rs1 000 imm[4:0] 0100011 SB
 imm[11:5]                rs2 rs1 001 imm[4:0] 0100011 SH
 imm[11:5]                rs2 rs1 010 imm[4:0] 0100011 SW
-
-imm[11:5] rs2 rs1 011 imm[4:0] 0100011 SD
+imm[11:5]                rs2 rs1 011 imm[4:0] 0100011 SD
 
 ---------------------- R-Type ----------------------------
 0000000                        rs2 rs1 000 rd 0110011 ADD

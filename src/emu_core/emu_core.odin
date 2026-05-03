@@ -1,5 +1,6 @@
 package emu_core
 
+import "base:runtime"
 import "core:os"
 import "core:testing"
 import "core:fmt"
@@ -71,8 +72,7 @@ EmuInstructionSType32 :: bit_field u32 {
 
 EmuInstructionBType32 :: bit_field u32 {
     _opcode:   u8 | 7,
-    _zero:     u8 | 1,
-    imm_lo:    u8 | 4,
+    imm_lo:    u8 | 5,
     funct_3:   u8 | 3,
     rs1:       u8 | 5,
     rs2:       u8 | 5,
@@ -97,12 +97,12 @@ EmuInstructionJType32 :: bit_field u32 {
 
 emu_make :: proc(max_memory: int) -> Emu64 {
     return Emu64 {
-        page_table = emu_make_page_table(1024 * 4),
+        page_table = emu_make_page_table(1024 * 16),
     }
 }
 
 emu_make_page_table :: proc(page_size: u64, allocator := context.allocator) -> EmuPageTable {
-    assert(page_size%8 == 0)
+    assert(page_size%16 == 0)
 
     return EmuPageTable {
         page_size = page_size,
@@ -193,7 +193,7 @@ emu_read_u64 :: proc(e: ^Emu64, vaddr: u64, loc := #caller_location) -> u64 {
     assert(page != nil, "no page found")
 
     offset := vaddr - page.start_addr
-    assert(offset+8 < u64(len(page.virtual_mem)), "u64 crosses page boundary")
+    assert(offset+7 < u64(len(page.virtual_mem)), "u64 crosses page boundary", loc)
 
     return u64((transmute(^u64)(&page.virtual_mem[offset]))^)
 }
@@ -203,7 +203,7 @@ emu_read_u32 :: proc(e: ^Emu64, vaddr: u64, loc := #caller_location) -> u32 {
     assert(page != nil, "no page found")
 
     offset := vaddr - page.start_addr
-    assert(offset+4 < u64(len(page.virtual_mem)), "u32 crosses page boundary")
+    assert(offset+3 < u64(len(page.virtual_mem)), "u32 crosses page boundary", loc)
 
     return u32((transmute(^u32)(&page.virtual_mem[offset]))^)
 }
@@ -213,7 +213,7 @@ emu_read_u16 :: proc(e: ^Emu64, vaddr: u64, loc := #caller_location) -> u16 {
     assert(page != nil, "no page found")
 
     offset := vaddr - page.start_addr
-    assert(offset+2 < u64(len(page.virtual_mem)), "u16 crosses page boundary")
+    assert(offset+1 < u64(len(page.virtual_mem)), "u16 crosses page boundary", loc)
 
     return u16((transmute(^u16)(&page.virtual_mem[offset]))^)
 }
@@ -232,7 +232,7 @@ emu_write_u64 :: proc(e: ^Emu64, vaddr: u64, value: u64) {
     assert(page != nil, "no page found")
 
     offset := vaddr - page.start_addr
-    assert(offset+8 < u64(len(page.virtual_mem)), "u64 crosses page boundary")
+    assert(offset+7 < u64(len(page.virtual_mem)), "u64 crosses page boundary")
 
     for i in 0..<8 {
         page.virtual_mem[int(offset)+i] = u8((value>>(uint(i)*8))&0xFF)
@@ -244,7 +244,7 @@ emu_write_u32 :: proc(e: ^Emu64, vaddr: u64, value: u32) {
     assert(page != nil, "no page found")
 
     offset := vaddr - page.start_addr
-    assert(offset+4 < u64(len(page.virtual_mem)), "u32 crosses page boundary")
+    assert(offset+3 < u64(len(page.virtual_mem)), "u32 crosses page boundary")
 
     for i in 0..<4 {
         page.virtual_mem[int(offset)+i] = u8((value>>(uint(i)*8))&0xFF)
@@ -256,7 +256,7 @@ emu_write_u16 :: proc(e: ^Emu64, vaddr: u64, value: u16) {
     assert(page != nil, "no page found")
 
     offset := vaddr - page.start_addr
-    assert(offset+2 < u64(len(page.virtual_mem)), "u16 crosses page boundary")
+    assert(offset+1 < u64(len(page.virtual_mem)), "u16 crosses page boundary")
 
     for i in 0..<2 {
         page.virtual_mem[int(offset)+i] = u8((value>>(uint(i)*8))&0xFF)
@@ -295,27 +295,27 @@ emu_run_interactive :: proc(e: ^Emu64) {
 
         prefix := instruction_lo&0b11
 
-        fmt.eprintf("Running instruction at 0x%16x: 0x%4x (0b%16b) opcode: 0b%7b", e.pc, instruction_lo, instruction_lo, instruction_lo&0b1111111)
+        fmt.printf("Running instruction at 0x%16x: 0x%4x (0b%16b) opcode: 0b%7b", e.pc, instruction_lo, instruction_lo, instruction_lo&0b1111111)
 
         old_pc := e.pc
 
         switch prefix {
             case 0b00: {
-                fmt.eprintf(" - RVC (Q0)")
+                fmt.printf(" - RVC (Q0)")
                 offset, cont := emu_do_rvc_q0(e, instruction_lo)
 
                 e.running = cont
                 e.pc += offset
             }
             case 0b01: {
-                fmt.eprintf(" - RVC (Q1)")
+                fmt.printf(" - RVC (Q1)")
                 offset, cont := emu_do_rvc_q1(e, instruction_lo)
 
                 e.running = cont
                 e.pc += offset
             }
             case 0b10: {
-                fmt.eprintf(" - RVC (Q2)")
+                fmt.printf(" - RVC (Q2)")
                 offset, cont := emu_do_rvc_q2(e, instruction_lo)
 
                 e.running = cont
@@ -324,7 +324,7 @@ emu_run_interactive :: proc(e: ^Emu64) {
 
             // >16b
             case 0b11: {
-                fmt.eprintf(" - RV32/64")
+                fmt.printf(" - RV32/64")
                 offset, cont := emu_do_rv64(e)
 
                 e.running = cont
@@ -335,12 +335,14 @@ emu_run_interactive :: proc(e: ^Emu64) {
         for bp in e.break_points {
             if bp == old_pc {
                 e.running = false
-                fmt.eprintln("\nHit Breakpoint")
+                fmt.println("\nHit Breakpoint")
                 break
             }
         }
 
-        fmt.eprintf("regs: %x\n", e.reg)
+        fmt.printf("regs: %x\n", e.reg)
+
+        runtime.free_all(context.temp_allocator)
     }
 }
 
@@ -352,22 +354,24 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
     OP_AUIPC                   :: 0b0010111
 
     OP_ARITHMETIC_GROUP        :: 0b0110011
-    OP_ARITHMETIC_64_GROUP        :: 0b0011011
+    OP_ARITHMETIC_64_GROUP     :: 0b0011011
+    OP_SHIFT_GROUP             :: 0b0010011 
     OP_BRANCH_GROUP            :: 0b1100011
     OP_STORE_GROUP             :: 0b0100011
+    OP_LOAD_GROUP              :: 0b0000011
 
     OP_SIGNED_ARITHMETIC_GROUP :: 0b0010011
 
     OP_ECALL                   :: 0b1110011
 
     instr := EmuInstruction32{}
-    instr.raw_instruction = emu_read_u32(e, e.pc)
+    instr.raw_instruction = u32(emu_read_u16(e, e.pc)) | (u32(emu_read_u16(e, e.pc+2)) << 16)
 
     if instr.opcode.v == OP_JAL {
         // J-Type
         imm_32 := (u32(instr.j_type.imm_hi) << 12) | (u32(instr.j_type.imm_lo) << 1) | (u32(instr.j_type.imm_mid) << 11) | (u32(instr.j_type.imm_msb) << 20)
 
-        imm := sign_extend_u32(imm_32, 20)
+        imm := sign_extend_u32(imm_32, 21)
 
         fmt.printf(" - jal x%d, 0x%x\n", instr.j_type.rd, imm)
 
@@ -386,7 +390,7 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
     }
     else if instr.opcode.v == OP_AUIPC {
         // U-Type
-        imm := i64(instr.u_type.imm<<12)
+        imm := u64(instr.u_type.imm<<12)
 
         result: u64
         if imm > 0 {
@@ -395,20 +399,130 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
             result = e.pc + u64(-imm)
         }
 
-        fmt.eprintf(" - auipc x%d <- (0x%x)\n", instr.u_type.rd, result)
+        fmt.printf(" - auipc x%d <- (0x%x)\n", instr.u_type.rd, result)
 
         emu_write_reg(e, int(instr.u_type.rd), result)
 
         return 4, true
     }
-    else if instr.opcode.v == OP_JALR || instr.opcode.v == 0b0000011 || instr.opcode.v == 0b0010011 {
+    else if instr.opcode.v == OP_JALR || instr.opcode.v == OP_LOAD_GROUP || instr.opcode.v == 0b0010011 {
         // I-Type or *R-Type
 
-        if instr.opcode.v == 0b0010011 && (instr.r_type.funct_3 == 0b001 || instr.r_type.funct_3 == 0b101) {
-            // *R-Type
+        if instr.opcode.v == OP_SHIFT_GROUP {
+            // I-Type
 
             // TODO
-            fmt.println(" - SLLI et al")
+            fmt.printf(" - SHIFT_GROUP - 0b%3b", instr.i_type.funct_3)
+
+            switch instr.r_type.funct_3 {
+                case 0b000: {
+                    rs1_val := emu_read_reg(e, int(instr.i_type.rs1))
+
+                    result := i64(rs1_val) + i64(i16(sign_extend_u16(instr.i_type.imm, 12)))
+
+                    fmt.printf(" - addi x%d, x%d, 0x%x\n", instr.i_type.rd, instr.i_type.rs1, instr.i_type.imm)
+
+                    emu_write_reg(e, int(instr.i_type.rd), u64(result))
+
+                    return 4, true
+                }
+                case 0b001: {
+                    rs1_val := emu_read_reg(e, int(instr.i_type.rs1))
+                    shamt := u64((instr.i_type.imm&0x3f))
+
+                    result := rs1_val << shamt
+
+                    fmt.printf(" - slli x%d, x%d, 0x%x\n", instr.i_type.rd, instr.i_type.rs1, shamt)
+
+                    emu_write_reg(e, int(instr.i_type.rd), result)
+
+                    return 4, true
+                }
+                case 0b010: {
+                    rs1_val := emu_read_reg(e, int(instr.i_type.rs1))
+                    imm := u64(instr.i_type.imm)
+
+                    fmt.printf(" - slti x%d, x%d, 0x%x\n", instr.i_type.rd, instr.i_type.rs1, instr.i_type.imm)
+
+                    if rs1_val < imm {
+                        emu_write_reg(e, int(instr.i_type.rd), 1)
+                    } else {
+                        emu_write_reg(e, int(instr.i_type.rd), 0)
+                    }
+
+                    return 4, true
+                }
+                case 0b011: {
+                    rs1_val := emu_read_reg(e, int(instr.i_type.rs1))
+                    imm := i64(i16(sign_extend_u16(instr.i_type.imm, 12)))
+
+                    fmt.printf(" - sltiu x%d, x%d, 0x%x\n", instr.i_type.rd, instr.i_type.rs1, instr.i_type.imm)
+
+                    if i64(rs1_val) < imm {
+                        emu_write_reg(e, int(instr.i_type.rd), 1)
+                    } else {
+                        emu_write_reg(e, int(instr.i_type.rd), 0)
+                    }
+
+                    return 4, true
+                }
+                case 0b100: {
+                    rs1_val := emu_read_reg(e, int(instr.i_type.rs1))
+                    imm := i64(i16(sign_extend_u16(instr.i_type.imm, 12)))
+
+                    fmt.printf(" - xori x%d, x%d, 0x%x\n", instr.i_type.rd, instr.i_type.rs1, instr.i_type.imm)
+
+                    result := i64(rs1_val) ~ imm
+
+                    emu_write_reg(e, int(instr.i_type.rd), u64(result))
+
+                    return 4, true
+                }
+                case 0b101: {
+                    rs1_val := emu_read_reg(e, int(instr.i_type.rs1))
+                    shamt := u64((instr.i_type.imm&0x3f))
+
+                    if (instr.i_type.imm>>26) > 0 {
+                        result := i64(rs1_val) >> shamt
+
+                        fmt.printf(" - srai x%d, x%d, 0x%x\n", instr.i_type.rd, instr.i_type.rs1, shamt)
+
+                        emu_write_reg(e, int(instr.i_type.rd), u64(result))
+                    } else {
+                        result := rs1_val >> shamt
+
+                        fmt.printf(" - srli x%d, x%d, 0x%x\n", instr.i_type.rd, instr.i_type.rs1, shamt)
+
+                        emu_write_reg(e, int(instr.i_type.rd), result)
+
+                        return 4, true
+                    }
+                }
+                case 0b110: {
+                    rs1_val := emu_read_reg(e, int(instr.i_type.rs1))
+                    imm := i64(i16(sign_extend_u16(instr.i_type.imm, 12)))
+
+                    fmt.printf(" - ori x%d, x%d, 0x%x\n", instr.i_type.rd, instr.i_type.rs1, instr.i_type.imm)
+
+                    result := i64(rs1_val) | imm
+
+                    emu_write_reg(e, int(instr.i_type.rd), u64(result))
+
+                    return 4, true
+                }
+                case 0b111: {
+                    rs1_val := emu_read_reg(e, int(instr.i_type.rs1))
+                    imm := i64(i16(sign_extend_u16(instr.i_type.imm, 12)))
+
+                    fmt.printf(" - andi x%d, x%d, 0x%x\n", instr.i_type.rd, instr.i_type.rs1, instr.i_type.imm)
+
+                    result := i64(rs1_val) & imm
+
+                    emu_write_reg(e, int(instr.i_type.rd), u64(result))
+
+                    return 4, true
+                }
+            }
         } else {
             // I-Type
 
@@ -416,7 +530,21 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
             fmt.printf(" - Load and Math")
 
             switch instr.opcode.v {
-                case OP_JALR: {}
+                case OP_JALR: {
+                    rs1_i32 := i32(emu_read_reg(e, int(instr.i_type.rs1))&0xFFFFFFFF)
+                    imm_i32 := i32(sign_extend_u16(instr.i_type.imm, 12))
+
+                    addr := u64(i64(rs1_i32 + imm_i32))&0xFFFFFFFFFFFFFFFE
+
+                    fmt.printf(" - jalr x%d, 0x%x\n", instr.i_type.rs1, imm_i32)
+
+                    emu_write_reg(e, int(instr.i_type.rd), e.pc + 4)
+
+                    return emu_instr_jump(e, addr)
+                }
+                case OP_LOAD_GROUP: {
+                    return emu_do_load_instr(e, instr.i_type)
+                }
                 case OP_SIGNED_ARITHMETIC_GROUP: {
                     return emu_do_signed_arithmetic_instr(e, instr.i_type)
                 }
@@ -425,9 +553,109 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
             fmt.printf("\n")
         }
     }
-    else if instr.opcode.v == OP_ARITHMETIC_GROUP || instr.opcode.v == OP_ARITHMETIC_64_GROUP {
+    else if instr.opcode.v == OP_ARITHMETIC_GROUP {
         // R-Type
         fmt.printf(" - OP_ARITHMETIC_GROUP 0b%3b", instr.i_type.funct_3)
+
+        switch instr.i_type.funct_3 {
+            case 0b000: {
+                rs1_val := emu_read_reg(e, int(instr.r_type.rs1))
+                rs2_val := emu_read_reg(e, int(instr.r_type.rs2))
+
+                result: u64
+                if instr.r_type.funct_7 > 0 {
+                    result = rs1_val - rs2_val
+
+                    fmt.printf(" - sub x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
+                } else {
+                    result = rs1_val + rs2_val
+                    fmt.printf(" - add x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
+                }
+
+                emu_write_reg(e, int(instr.r_type.rd), result)
+
+                return 4, true
+            }
+            case 0b001: {
+                rs1_val := emu_read_reg(e, int(instr.r_type.rs1))
+                rs2_val := emu_read_reg(e, int(instr.r_type.rs1))&0x1f
+
+                result := rs1_val << rs2_val
+
+                fmt.printf(" - sll x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
+
+                emu_write_reg(e, int(instr.r_type.rd), result)
+
+                return 4, true
+            }
+            case 0b010: {
+                rs1_val := i64(emu_read_reg(e, int(instr.r_type.rs1)))
+                rs2_val := i64(emu_read_reg(e, int(instr.r_type.rs2)))
+
+                fmt.printf(" - slt x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
+
+                if rs1_val < rs2_val {
+                    emu_write_reg(e, int(instr.r_type.rd), 1)
+                } else {
+                    emu_write_reg(e, int(instr.r_type.rd), 0)
+                }
+
+                return 4, true
+            }
+            case 0b011: {
+                rs1_val := emu_read_reg(e, int(instr.r_type.rs1))
+                rs2_val := emu_read_reg(e, int(instr.r_type.rs2))
+
+                fmt.printf(" - sltu x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
+
+                if rs1_val < rs2_val {
+                    emu_write_reg(e, int(instr.r_type.rd), 1)
+                } else {
+                    emu_write_reg(e, int(instr.r_type.rd), 0)
+                }
+
+                return 4, true
+            }
+            case 0b100: {}
+            case 0b101: {
+                rs1_val := emu_read_reg(e, int(instr.r_type.rs1))
+                rs2_val := emu_read_reg(e, int(instr.r_type.rs1))&0x1f
+
+                result: i64
+                if instr.r_type.funct_7 > 0 {
+                    result = i64(rs1_val) >> rs2_val
+
+                    fmt.printf(" - srl x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
+                } else {
+                    result = i64(rs1_val) >> rs2_val
+
+                    fmt.printf(" - sra x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
+                }
+
+                emu_write_reg(e, int(instr.r_type.rd), u64(result))
+
+                return 4, true
+            }
+            case 0b110: {}
+            case 0b111: {
+                rs1_val := emu_read_reg(e, int(instr.r_type.rs1))
+                rs2_val := emu_read_reg(e, int(instr.r_type.rs2))
+
+                fmt.printf(" - and x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
+
+                rd_val := rs1_val & rs2_val
+
+                emu_write_reg(e, int(instr.r_type.rd), rd_val)
+
+                return 4, true
+            }
+        }
+
+        fmt.printf("\n")
+    }
+    else if instr.opcode.v == OP_ARITHMETIC_64_GROUP {
+        // R-Type
+        fmt.printf(" - OP_ARITHMETIC_64_GROUP 0b%3b", instr.i_type.funct_3)
 
         switch instr.i_type.funct_3 {
             case 0b000: {
@@ -444,7 +672,8 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
             }
             case 0b001: {}
             case 0b010: {}
-            case 0b011: {}
+            case 0b011: {
+            }
             case 0b100: {}
             case 0b101: {}
             case 0b110: {}
@@ -455,16 +684,158 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
     }
     else if instr.opcode.v == OP_BRANCH_GROUP {
         // B-Type
-        fmt.println(" - OP_BRANCH_GROUP ")
+        fmt.printf(" - BRANCH GROUP 0b%3b", instr.b_type.funct_3)
+
+        // Unscramble (imm_hi[12|10:5], imm_lo[4:1|11])
+        imm_lo: = unscramble_imm(u32(instr.b_type.imm_lo), { 4,3,2,1,11 })
+        imm_hi: = unscramble_imm(u32(instr.b_type.imm_hi), { 12,10,9,8,7,6,5 })
+
+        imm := u16(imm_hi | imm_lo)
+
+        rs1_val := emu_read_reg(e, int(instr.b_type.rs1))
+        rs2_val := emu_read_reg(e, int(instr.b_type.rs2))
+
+        offset := i32(sign_extend_u16(imm, 13))
+
+        switch instr.b_type.funct_3 {
+            case 0b000: {
+                fmt.printf(" - beq x%d, x%d, 0x%x\n", instr.b_type.rs1, instr.b_type.rs2, offset)
+
+                if i64(rs1_val) == i64(rs2_val) {
+                    return emu_instr_jump_rel(e, offset)
+                }
+            }
+            case 0b001: {
+                fmt.printf(" - bne x%d, x%d, 0x%x\n", instr.b_type.rs1, instr.b_type.rs2, offset)
+
+                if i64(rs1_val) != i64(rs2_val) {
+                    return emu_instr_jump_rel(e, offset)
+                }
+            }
+            case 0b100: {
+                fmt.printf(" - blt x%d, x%d, 0x%x\n", instr.b_type.rs1, instr.b_type.rs2, offset)
+
+                if i64(rs1_val) < i64(rs2_val) {
+                    return emu_instr_jump_rel(e, offset)
+                }
+            }
+            case 0b101: {
+                fmt.printf(" - bge x%d, x%d, 0x%x\n", instr.b_type.rs1, instr.b_type.rs2, offset)
+                if i64(rs1_val) >= i64(rs2_val) {
+                    return emu_instr_jump_rel(e, offset)
+                }
+            }
+            case 0b110: {
+                fmt.printf(" - bltu x%d, x%d, 0x%x\n", instr.b_type.rs1, instr.b_type.rs2, offset)
+
+                if rs1_val < rs2_val {
+                    return emu_instr_jump_rel(e, offset)
+                }
+            }
+            case 0b111: {
+                fmt.printf(" - bgeu x%d, x%d, 0x%x\n", instr.b_type.rs1, instr.b_type.rs2, offset)
+
+                if rs1_val >= rs2_val {
+                    return emu_instr_jump_rel(e, offset)
+                }
+            }
+        }
+
+        return 4, true
     }
     else if instr.opcode.v == OP_STORE_GROUP {
         // S-Type
-        fmt.println(" - OP_STORE_GROUP")
+        rs1_val := i64(emu_read_reg(e, int(instr.s_type.rs1)))
+
+        imm := i64(sign_extend_u32((u32(instr.s_type.imm_hi)<<5) | u32(instr.s_type.imm_lo), 12))
+        addr := u64(rs1_val + imm)
+
+        rs2_val := emu_read_reg(e, int(instr.s_type.rs2))
+
+        switch instr.s_type.funct_3 {
+            case 0b000: {
+                fmt.printf(" - sb x%d, x%d, 0x%x\n", instr.s_type.rs1, instr.s_type.rs2, imm)
+                emu_write_u8(e, addr, u8(rs2_val&0xFF))
+            }
+            case 0b001: {
+                fmt.printf(" - sh x%d, x%d, 0x%x\n", instr.s_type.rs1, instr.s_type.rs2, imm)
+                emu_write_u16(e, addr, u16(rs2_val&0xFFFF))
+            }
+            case 0b010: {
+                fmt.printf(" - sw x%d, x%d, 0x%x\n", instr.s_type.rs1, instr.s_type.rs2, imm)
+                emu_write_u32(e, addr, u32(rs2_val&0xFFFFFFFF))
+            }
+            case 0b011: {
+                fmt.printf(" - sd x%d, x%d, 0x%x\n", instr.s_type.rs1, instr.s_type.rs2, imm)
+                emu_write_u64(e, addr, rs2_val)
+            }
+        }
+
+        return 4, true
     } else if instr.opcode.v == OP_ECALL {
-        fmt.println("ecall hahaha")
+        fmt.println(" - ECALL")
 
         // a7 (x15) syscall id
         // a0-a? (x8-x?) arguments
+
+        SYS_TRAP    :: 0xFF
+        SYS_PRINTLN :: 0xA
+
+        SYS_LINUX_WRITE :: 0x40
+
+        sys_call_id := emu_read_reg(e, 17)
+
+        switch sys_call_id {
+            case SYS_TRAP: {
+                trap_code := emu_read_reg(e, 10)
+
+                fmt.eprintf("\n\nTRAP: 0x%x\n\n", trap_code)
+                return 0, false
+            }
+            case SYS_LINUX_WRITE:  {
+                fd := emu_read_reg(e, 10)
+                buf := emu_read_reg(e, 11)
+                count := emu_read_reg(e, 12)
+
+                fmt.printf("0x%x: %v\n", buf, count)
+
+                str_buf := make([]u8, count, allocator = context.temp_allocator)
+
+                for i in 0..<count {
+                    str_buf[i] = emu_read_u8(e, buf+i)
+                }
+
+                str := string(str_buf)
+
+                fmt.eprintf("%v", str)
+                // fmt.eprintf("\nSYS_LINUX_WRITE: %v\n\n", str)
+
+                emu_write_reg(e, 10, count)
+            }
+            case SYS_PRINTLN: {
+                str_addr := emu_read_reg(e, 10)
+                str_len := emu_read_reg(e, 11)
+
+                // fmt.printf("0x%x: %v", str_addr, str_len)
+
+                str_buf := make([]u8, str_len, allocator = context.temp_allocator)
+
+                for i in 0..<str_len {
+                    str_buf[i] = emu_read_u8(e, str_addr+i)
+                }
+
+                str := string(str_buf)
+
+                fmt.eprintf("%v", str)
+                // fmt.eprintf("\nSYS_PRINTLN: %v\n\n", str)
+            }
+            case: {
+                fmt.eprintf("\nInvalid SYSCALL 0x%x\n\n", sys_call_id)
+                emu_write_reg(e, 10, 0xFEFEFEFEFEFEFEFE)
+            }
+        }
+
+        return 4, true
     }
 
 
@@ -474,7 +845,7 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
 
     //     result := e.pc + (u64(input_2)<<12)
 
-    //     fmt.eprintf(" - auipc x%d <- (0x%0x)\n", input_1, result)
+    //     fmt.printf(" - auipc x%d <- (0x%0x)\n", input_1, result)
 
     //     emu_write_reg(e, int(input_1), result)
 
@@ -484,31 +855,108 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
     return
 }
 
+unscramble_imm :: proc(scrambled: u32, mapping: []u8) -> (imm: u32) {
+    num_bits := u32(len(mapping))
+
+    i: u32
+    for i < num_bits {
+        contiguous_index := i
+
+        for j in (i+1)..<num_bits {
+            if mapping[j] == mapping[j-1]-1 {
+                contiguous_index = j
+            } else {
+                break
+            }
+        }
+
+        mask: u32
+        for j in i..=contiguous_index {
+            mask |= 1 << (num_bits-j-1)
+        }
+
+        scram_bit := num_bits-i-1
+        bit := u32(mapping[i])
+
+        if scram_bit > bit {
+            imm |= (scrambled&mask)>>(scram_bit-bit)
+        } else {
+            imm |= (scrambled&mask)<<(bit-scram_bit)
+        }
+
+        i = contiguous_index+1
+    }
+
+    return
+}
+
 emu_do_rvc_q0 :: proc(e: ^Emu64, instr: u16) -> (pc_offset: u64, cont: bool) {
     suffix := instr>>13
-    fmt.eprintf(" - 0b%3b", suffix)
+    fmt.printf(" - 0b%3b", suffix)
 
     switch suffix {
-        case 0b000: {}
+        case 0b000: {
+            rd := (instr>>2)&0b111
+            imm_scrambled := u32((instr>>5) & 0xFF) // 8bit
+
+            if imm_scrambled == 0 do return 2, false
+
+            // Unscramble (imm[5:4|9:6|2|3])
+            imm: u64 = u64(unscramble_imm(imm_scrambled, { 5,4,9,8,7,6,2,3 }))
+
+            // FIXME
+            imm_64 := imm//*4
+
+            stack_reg_value := emu_read_reg(e, REG_X2)
+            stack_reg_value += imm_64
+
+            fmt.printf(" - c.addi4spn x%d, 0x%x (result: 0x%x)\n", rd+8, imm_64, stack_reg_value)
+
+            emu_write_reg_cext(e, int(rd), stack_reg_value)
+
+            return 2, true
+        }
         case 0b001: {}
-        case 0b010: {}
+        case 0b010: {
+            rd := (instr>>2)&0b111
+            rs1 := (instr>>7)&0b111
+
+            imm_1 := (instr>>5)&0b11
+            imm_2 := (instr>>10)&0b111
+
+            // FIXME
+            imm := u64(((imm_1&0x1)<<6) | ((imm_1&0b10)<<2) | (imm_2<<3))
+
+            reg_value := emu_read_reg_cext(e, int(rs1))
+            addr := reg_value + imm
+
+            value := i64(i32(emu_read_u32(e, addr)))
+
+            // FIXME2 might need to only replace the 32 lower bits
+            emu_write_reg_cext(e, int(rd), u64(value))
+
+            fmt.printf(" - c.lw x%d, x%d 0x%x\n", rd+8, rs1+8, imm)
+
+            return 2, true
+        }
         case 0b011: {
             rd := (instr>>2)&0b111
             rs1 := (instr>>7)&0b111
 
             imm_lo := (instr>>10)&0b111
-            imm_hi := (instr>>5)&0b111
+            imm_hi := (instr>>5)&0b11
 
-            imm := (imm_hi << 3) | imm_lo
+            // FIXME
+            imm := u64((imm_hi << 6) | (imm_lo << 3))//*8
 
             reg_value := emu_read_reg_cext(e, int(rs1))
-            addr := reg_value + u64(imm)*8
+            addr := reg_value + imm
 
             value := emu_read_u64(e, addr)
 
             emu_write_reg_cext(e, int(rd), value)
 
-            fmt.eprintf(" - c.ld x%d, x%d 0x%x\n", rd+8, rs1+8, imm)
+            fmt.printf(" - c.ld x%d, x%d 0x%x\n", rd+8, rs1+8, imm)
 
             return 2, true
         }
@@ -518,7 +966,7 @@ emu_do_rvc_q0 :: proc(e: ^Emu64, instr: u16) -> (pc_offset: u64, cont: bool) {
 
             bit_12 := (instr&0x1000) > 0
 
-            fmt.eprintf(" - 0x%x 0x%x %d", input_1, input_2, bit_12)
+            fmt.printf(" - 0x%x 0x%x %d", input_1, input_2, bit_12)
 
             if bit_12 {
 
@@ -527,38 +975,29 @@ emu_do_rvc_q0 :: proc(e: ^Emu64, instr: u16) -> (pc_offset: u64, cont: bool) {
                     // C.JR
                     dst := emu_read_reg(e, int(input_2))
 
-                    fmt.eprintf(" - c.jr x%d (0x%x)\n", input_2, dst)
+                    fmt.printf(" - c.jr x%d (0x%x)\n", input_2, dst)
 
-                    emu_instr_jump(e, dst)
-
-                    return 0, true
+                    return emu_instr_jump(e, dst)
                 }
             }
         }
         case 0b101: {
-            // C.J (Unconditional Jump)
-            imm := u64((instr>>2) & 0x7FF) // 10bit immediate
-
-            // Unscramble (imm[11|4|9:8|10|6|7|3:1|5])
-            addr: u64
-            addr |= (imm&0x400)<<1  // 10  -> 11
-            addr |= (imm&0x200)>>5  // 9   -> 4
-            addr |= (imm&0x180)<<1  // 8:7 -> 9:8
-            addr |= (imm&0x40)<<4   // 6   -> 10
-            addr |= (imm&0x20)<<1   // 5   -> 6
-            addr |= (imm&0x10)<<3   // 4   -> 7
-                                    // 3:1 -> 3:1
-            addr |= (imm&0x1)<<5    // 0   -> 5
-
-            dst := e.pc+addr
-            fmt.eprintf(" - c.j 0x%x (0x%x)\n", addr, dst)
-
-            emu_instr_jump(e, dst)
-
-            return 0, true
         }
         case 0b110: {}
-        case 0b111: {}
+        case 0b111: {
+            rs1 := (instr>>7)&0b111 // 3bit
+            rs2 := (instr>>2)&0b111 // 3bit
+            // FIXME
+            imm := u64(((instr<<1)&0xC0) | ((instr>>7)&0x38))//*8
+
+            addr := emu_read_reg_cext(e, int(rs1)) + imm
+
+            fmt.printf(" - c.sd x%d, x%d (0x%x)\n", rs2, rs1, imm)
+
+            emu_write_u64(e, addr, emu_read_reg_cext(e, int(rs2)))
+
+            return 2, true
+        }
     }
 
     return
@@ -566,41 +1005,103 @@ emu_do_rvc_q0 :: proc(e: ^Emu64, instr: u16) -> (pc_offset: u64, cont: bool) {
 
 emu_do_rvc_q1 :: proc(e: ^Emu64, instr: u16) -> (pc_offset: u64, cont: bool) {
     suffix := instr>>13
-    fmt.eprintf(" - 0b%3b", suffix)
+    fmt.printf(" - 0b%3b", suffix)
 
     switch suffix {
         case 0b000: {
             rd := (instr>>7)&0x1F // 5 bit
-
-            // NOP: rd = 0
-            if rd == 0 { return 2, true }
 
             imm_lo := (instr>>2)&0x1F
             imm_hi := (instr>>12)&0b1
 
             imm := (imm_hi << 5) | imm_lo
 
-            if imm == 0 { return 2, true }
+            if imm == 0 && rd == 0 {
+                fmt.printf(" - c.nop\n")
+                return 2, true
+            }
 
             imm_extended := i64(sign_extend_u16(imm, 6))
             reg_value := i64(emu_read_reg(e, int(rd)))
             value := reg_value + imm_extended
 
-            fmt.eprintf(" - c.addi x%d 0x%x (result: 0x%x)\n", rd, imm_extended, value)
+            fmt.printf(" - c.addi x%d 0x%x (result: 0x%x)\n", rd, imm_extended, value)
 
             emu_write_reg(e, int(rd), u64(value))
 
             return 2, true
         }
         case 0b001: {
-            rd := (instr>>7)&0x1F
+            rd := (instr>>7)&0x1F // 5 bit
 
-            if rd == 0 { return 2, true }
+            imm_lo := (instr>>2)&0x1F
+            imm_hi := (instr>>12)&0b1
+
+            imm := (imm_hi << 5) | imm_lo
+
+            if imm == 0 && rd == 0 {
+                fmt.printf(" - c.nop\n")
+                return 2, true
+            }
+
+            imm_extended := i32(sign_extend_u16(imm, 6))
+            reg_value := i32(emu_read_reg(e, int(rd))&0xFFFFFFFF)
+            value := reg_value + imm_extended
+
+            fmt.printf(" - c.addiw x%d 0x%x (result: 0x%x)\n", rd, imm_extended, value)
+
+            emu_write_reg(e, int(rd), u64(i64(value)))
+
+            return 2, true
         }
         case 0b010: {
+            rd := (instr>>7)&0x1F // 5bit
+
+            if rd != 0 {
+                imm := i64(sign_extend_u16(((instr>>2)&0x1F) | ((instr>>12)&1)<<5, 6)) // 5bit
+
+                fmt.printf(" - c.li x%v, 0x%x\n", rd, u64(imm))
+
+                emu_write_reg(e, int(rd), u64(imm))
+            }
+
             return 2, true
         }
         case 0b011: {
+            rd := (instr>>7)&0x1F // 5bit
+
+            if rd == 2 {
+                imm_scrambled := u32((instr>>2) & 0x1F) // 8bit
+                imm_12 := u32((instr>>12)&0x1)
+
+                // Unscramble (imm[4|6|8:7|5])
+                imm: = u32(unscramble_imm(imm_scrambled, { 4,6,8,7,5 }))
+                imm |= (imm_12<<9)
+
+                if imm == 0 do return 2, true
+
+                // FIXME
+                imm_64 := i64(sign_extend_u32(imm, 10))//*16
+
+                stack_reg_value := i64(emu_read_reg(e, REG_X2))
+                stack_reg_value += imm_64
+
+                fmt.printf(" - c.addi16sp x%d, 0x%x (result: 0x%x)\n", rd, u64(imm_64), u64(stack_reg_value))
+
+                emu_write_reg(e, int(rd), u64(stack_reg_value))
+
+                return 2, true
+            } else if rd != 0 {
+                imm_1 := (instr>>2)&0x1F // 5bit
+                imm_2 := (instr>>12)&0x1 // 1bit
+
+                imm := i64(sign_extend_u32((u32(imm_1)<<12) | (u32(imm_2)<<17), 18))
+
+                fmt.printf(" - c.lui x%v, 0x%x\n", rd, imm)
+
+                emu_write_reg(e, int(rd), u64(imm))
+            }
+
             return 2, true
         }
         case 0b100: {
@@ -608,35 +1109,103 @@ emu_do_rvc_q1 :: proc(e: ^Emu64, instr: u16) -> (pc_offset: u64, cont: bool) {
             funct_1 := (instr>>5)&0b11
             funct_2 := (instr>>10)&0b11
 
-            fmt.eprintf(" - bit12 %v f2 0b%2b f1 0b%2b", bit_12, funct_2, funct_1)
+            fmt.printf(" - bit12 %v f2 0b%2b f1 0b%2b", bit_12, funct_2, funct_1)
 
-            if bit_12 {
+            if bit_12 && funct_2 == 0b11 {
             } else {
                 imm := (instr>>2)&0x1F  // 5bit
                 rs2 := (instr>>2)&0b111 // 3bit
                 rd := (instr>>7)&0b111  // 3bit
 
                 switch funct_2 {
-                    case 0b00: {}
-                    case 0b01: {}
-                    case 0b10: {}
+                    case 0b00: {
+                        imm_extended := u64(imm | (((instr>>12)&0x1)<<5))
+                        reg_value := emu_read_reg_cext(e, int(rd))
+
+                        result := reg_value >> imm_extended
+
+                        fmt.printf(" - c.srli x%v, 0x%x\n", rd+8, imm_extended)
+
+                        emu_write_reg_cext(e, int(rd), result)
+
+                        return 2, true
+                    }
+                    case 0b01: {
+                        imm_extended := u64(imm | (((instr>>12)&0x1)<<5))
+                        reg_value := emu_read_reg_cext(e, int(rd))
+
+                        result := i64(reg_value) >> imm_extended
+
+                        fmt.printf(" - c.srai x%v, 0x%x\n", rd+8, imm_extended)
+
+                        emu_write_reg_cext(e, int(rd), u64(result))
+
+                        return 2, true
+                    }
+                    case 0b10: {
+                        // C.ANDI
+
+                        imm_extended := i64(sign_extend_u16(imm | (((instr>>12)&0x1)<<5), 6))
+                        reg_value := i64(emu_read_reg_cext(e, int(rd)))
+
+                        result := reg_value & imm_extended
+
+                        fmt.printf(" - c.andi x%v, 0x%x\n", rd+8, imm_extended)
+
+                        emu_write_reg_cext(e, int(rd), u64(result))
+
+                        return 2, true
+                    }
                     case 0b11: {
                         switch funct_1 {
-                            case 0b00: {}
-                            case 0b01: {}
+                            case 0b00: {
+                                rs2_val := emu_read_reg_cext(e, int(rs2))
+                                rd_val := emu_read_reg_cext(e, int(rd))
+
+                                rd_val -= rs2_val
+
+                                fmt.printf(" - c.sub x%v, x%v\n", rd+8, rs2+8)
+
+                                emu_write_reg_cext(e, int(rd), rd_val)
+
+                                return 2, true
+                            }
+                            case 0b01: {
+                                rs2_val := emu_read_reg_cext(e, int(rs2))
+                                rd_val := emu_read_reg_cext(e, int(rd))
+
+                                rd_val ~= rs2_val
+
+                                fmt.printf(" - c.xor x%v, x%v\n", rd+8, rs2+8)
+
+                                emu_write_reg_cext(e, int(rd), rd_val)
+
+                                return 2, true
+                            }
                             case 0b10: {
                                 rs2_val := emu_read_reg_cext(e, int(rs2))
                                 rd_val := emu_read_reg_cext(e, int(rd))
 
                                 rd_val |= rs2_val
 
-                                fmt.eprintf(" - c.or x%v, x%v\n", rd+8, rs2+8)
+                                fmt.printf(" - c.or x%v, x%v\n", rd+8, rs2+8)
 
                                 emu_write_reg_cext(e, int(rd), rd_val)
 
                                 return 2, true
                             }
-                            case 0b11: {}
+                            case 0b11: {
+                                rs2_val := emu_read_reg_cext(e, int(rs2))
+                                rd_val := emu_read_reg_cext(e, int(rd))
+
+                                rd_val &= rs2_val
+
+                                fmt.printf(" - c.and x%v, x%v\n", rd+8, rs2+8)
+
+                                emu_write_reg_cext(e, int(rd), rd_val)
+
+                                return 2, true
+                            }
                         }
                     }
                 }
@@ -644,17 +1213,51 @@ emu_do_rvc_q1 :: proc(e: ^Emu64, instr: u16) -> (pc_offset: u64, cont: bool) {
         }
         case 0b101: {
             // C.J (Unconditional Jump)
-            addr := u64((instr>>2) & 0x7FF) // 10bit immediate
-            dst := e.pc+addr
+            imm := u32((instr>>2) & 0x7FF) // 10bit immediate
 
-            fmt.eprintf(" - c.j 0x%x (0x%x)\n", addr, dst)
+            // Unscramble (imm[11|4|9:8|10|6|7|3:1|5])
+            offset: = sign_extend_u32(unscramble_imm(imm, { 11,4,9,8,10,6,7,3,2,1,5 }), 12)
 
-            emu_instr_jump(e, dst)
+            fmt.printf(" - c.j 0x%x\n", offset)
 
-            return 0, true
+            return emu_instr_jump_rel(e, offset)
         }
-        case 0b110: {}
-        case 0b111: {}
+        case 0b110: {
+            rs1 := (instr>>7)&0b111
+
+            imm_lo: = unscramble_imm(u32((instr>>2)&0x1F),   { 7,6,2,1,5 })
+            imm_hi: = unscramble_imm(u32((instr>>10)&0b111), { 8,4,3 })
+
+            imm := imm_hi | imm_lo
+
+            offset := i32(sign_extend_u32(imm, 9))
+
+            fmt.printf(" - c.beqz x%x (0x%x)\n", rs1, offset)
+
+            if emu_read_reg_cext(e, int(rs1)) == 0 {
+                return emu_instr_jump_rel(e, offset)
+            }
+
+            return 2, true
+        }
+        case 0b111: {
+            rs1 := (instr>>7)&0b111
+
+            imm_lo: = unscramble_imm(u32((instr>>2)&0x1F),   { 7,6,2,1,5 })
+            imm_hi: = unscramble_imm(u32((instr>>10)&0b111), { 8,4,3 })
+
+            imm := imm_hi | imm_lo
+
+            offset := i32(sign_extend_u32(imm, 9))
+
+            fmt.printf(" - c.bnez x%x (0x%x)\n", rs1, offset)
+
+            if emu_read_reg_cext(e, int(rs1)) != 0 {
+                return emu_instr_jump_rel(e, offset)
+            }
+
+            return 2, true
+        }
     }
 
     return
@@ -662,40 +1265,66 @@ emu_do_rvc_q1 :: proc(e: ^Emu64, instr: u16) -> (pc_offset: u64, cont: bool) {
 
 emu_do_rvc_q2 :: proc(e: ^Emu64, instr: u16) -> (pc_offset: u64, cont: bool) {
     suffix := instr>>13
-    fmt.eprintf(" - 0b%3b", suffix)
+    fmt.printf(" - 0b%3b", suffix)
 
     switch suffix {
         case 0b000: {
             rd := (instr>>7)&0x1F // 5bit
-            imm := u64((instr>>2)&0x1F | (instr>>12)&0b1)
+            imm := u64((instr>>2)&0x1F | (((instr>>12)&0b1)<<5))
 
-            if rd == 0 { return 2, true }
+            if rd == 0 do return 2, true
 
             reg_value := emu_read_reg(e, int(rd))
             reg_value = reg_value << imm
 
-            fmt.eprintf(" - c.slli x%d, 0x%x\n", int(rd), imm)
+            fmt.printf(" - c.slli x%d, 0x%x\n", int(rd), imm)
 
             emu_write_reg(e, int(rd), reg_value)
 
             return 2, true
         }
         case 0b001: {}
-        case 0b010: {}
+        case 0b010: {
+            rd := (instr>>7)&0x1F // 5bit
+            imm_1 := u32((instr>>2)&0x1F) // 5bit
+            imm_2 := u32((instr>>12)&0x1) // 1bit
+
+            if rd == 0 do return 2, true
+
+            // FIXME: is this necessary? is it already scaled by 8?
+            // Unscramble the encoding (offset[4:2|7:6])
+            imm: = u64(unscramble_imm(imm_1, { 4,3,2,7,6 }))
+            imm |= u64(imm_2)<<5
+
+            imm = imm//*8
+
+            addr := imm + emu_read_reg(e, REG_X2)
+
+            fmt.printf(" - c.lwsp x%d (0x%x)\n", rd, imm)
+
+            // FIXME: sign extended?
+            value := i64(i32(emu_read_u32(e, addr)))
+            emu_write_reg(e, int(rd), u64(value))
+
+            return 2, true
+        }
         case 0b011: {
             rd := (instr>>7)&0x1F // 5bit
-            imm_1 := (instr>>2)&0x3F // 5bit
-            imm_2 := (instr>>12)&0x1 // 1bit
+            imm_1 := u32((instr>>2)&0x1F) // 5bit
+            imm_2 := u32((instr>>12)&0x1) // 1bit
 
-            if rd == 0 { return 2, true }
+            if rd == 0 do return 2, true
 
             // FIXME: is this necessary? is it already scaled by 8?
             // Unscramble the encoding (offset[4:3|8:6])
-            imm := ((imm_1&0x18) | ((imm_1&0b111) << 6)) | (imm_2 << 5)
+            imm: = u64(unscramble_imm(imm_1, { 4,3,8,7,6 }))
+            imm |= u64(imm_2)<<5
 
-            addr := u64(imm)*8 + emu_read_reg(e, REG_X2)
+            imm = imm//*8
 
-            fmt.eprintf(" - c.ldsp x%d (0x%x)\n", rd, imm)
+            addr := imm + emu_read_reg(e, REG_X2)
+
+            fmt.printf(" - c.ldsp x%d (0x%x)\n", rd, imm)
 
             value := emu_read_u64(e, addr)
             emu_write_reg(e, int(rd), value)
@@ -709,34 +1338,76 @@ emu_do_rvc_q2 :: proc(e: ^Emu64, instr: u16) -> (pc_offset: u64, cont: bool) {
             bit_12 := (instr&0x1000) > 0
 
             if bit_12 {
+                if input_2 != 0 {
+                    if input_1 == 0 {
+                        emu_write_reg(e, int(1), e.pc+2)
+                        e.pc = emu_read_reg(e, int(input_2))
 
+                        fmt.printf(" - c.jalr x%d\n", input_2)
+
+                        return 0, true
+                    } else {
+                        rs2_val := emu_read_reg(e, int(input_1))
+                        rd_val := emu_read_reg(e, int(input_2))
+
+                        rd_val += rs2_val
+
+                        fmt.printf(" - c.add x%d, x%d\n", input_2, input_1)
+
+                        emu_write_reg(e, int(input_2), rd_val)
+
+                        return 2, true
+                    }
+                } else {
+
+                }
             } else {
                 if input_1 == 0 {
                     // C.JR
                     dst := emu_read_reg(e, int(input_2))
 
-                    fmt.eprintf(" - c.jr x%d (0x%x)\n", input_2, dst)
+                    fmt.printf(" - c.jr x%d (0x%x)\n", input_2, dst)
 
                     return emu_instr_jump(e, dst)
+                } else if input_1 != 0 && input_2 != 0 {
+                    fmt.printf(" - c.mv x%d x%d\n", input_2, input_1)
+
+                    emu_write_reg(e, int(input_2), emu_read_reg(e, int(input_1)))
+
+                    return 2, true
                 }
             }
         }
         case 0b101: {}
-        case 0b110: {}
-        case 0b111: {
-            // C.SDSP is an RV64C-only instruction that stores a 64-bit value in register rs2 to memory. It computes an effective address by adding the zero-extended offset, scaled by 8, to the stack pointer, x2. It expands to sd rs2, offset(x2).
-
+        case 0b110: {
             rs2   := (instr>>2)&0x1F // 5bit
-            imm_1 := (instr>>7)&0x3F // 6bit
+            imm_1 := u32((instr>>7)&0x3F) // 6bit
 
             // FIXME: is this necessary? is it already scaled by 8?
             // Unscramble the encoding (offset[5:3|8:6])
-            imm := ((imm_1&0x38) | ((imm_1&0b111) << 6))
+            imm: = u64(unscramble_imm(imm_1, { 5,4,3,2,7,6 }))//*8
 
-            addr := u64(imm)*8 + emu_read_reg(e, REG_X2)
+            addr := imm + emu_read_reg(e, REG_X2)
+            reg_value := f32(u32(emu_read_reg(e, int(rs2))&0xFFFFFFFF))
+
+            fmt.printf(" - c.fswsp x%d (0x%x)\n", rs2, imm)
+
+            emu_write_u64(e, addr, u64(reg_value))
+
+            return 2, true
+        }
+        case 0b111: {
+            rs2   := (instr>>2)&0x1F // 5bit
+            imm_1 := u32((instr>>7)&0x3F) // 6bit
+
+            // FIXME: is this necessary? is it already scaled by 8?
+            // Unscramble the encoding (offset[5:3|8:6])
+            imm: = u64(unscramble_imm(imm_1, { 5,4,3,8,7,6 }))//*8
+
+            addr := imm + emu_read_reg(e, REG_X2)
             reg_value := emu_read_reg(e, int(rs2))
 
-            fmt.eprintf(" - c.sdsp x%d (0x%x)\n", rs2, imm)
+            fmt.printf(" - c.sdsp x%d (0x%x)\n", rs2, imm)
 
             emu_write_u64(e, addr, reg_value)
 
@@ -801,14 +1472,61 @@ sign_extend_u8 :: proc(value: u8, bits: u8) -> i8 {
     return i8((value ~ mask) - mask)
 }
 
+emu_do_load_instr :: proc(e: ^Emu64, instr: EmuInstructionIType32) -> (pc_offset: u64, cont: bool) {
+    fmt.printf(" - LOAD Group 0b%3b", instr.funct_3)
+
+    rs1_val := i64(emu_read_reg(e, int(instr.rs1)))
+
+    imm := i64(sign_extend_u16(instr.imm, 12))
+    addr := u64(rs1_val + imm)
+
+    switch instr.funct_3 {
+        case 0b000: {
+            value := i64(i8(emu_read_u8(e, addr)))
+            fmt.printf(" - lb x%d, x%d, 0x%x\n", instr.rd, instr.rs1, imm)
+            emu_write_reg(e, int(instr.rd), u64(value))
+        }
+        case 0b001: {
+            value := i64(i16(emu_read_u16(e, addr)))
+            fmt.printf(" - lh x%d, x%d, 0x%x\n", instr.rd, instr.rs1, imm)
+            emu_write_reg(e, int(instr.rd), u64(value))
+        }
+        case 0b010: {
+            value := i64(i32(emu_read_u32(e, addr)))
+            fmt.printf(" - lw x%d, x%d, 0x%x\n", instr.rd, instr.rs1, imm)
+            emu_write_reg(e, int(instr.rd), u64(value))
+        }
+        case 0b011: {
+            value := emu_read_u64(e, addr)
+            fmt.printf(" - ld x%d, x%d, 0x%x\n", instr.rd, instr.rs1, imm)
+            emu_write_reg(e, int(instr.rd), value)
+        }
+        case 0b100: {
+            value := u64(emu_read_u8(e, addr))
+            fmt.printf(" - lbu x%d, x%d, 0x%x\n", instr.rd, instr.rs1, instr.imm)
+            emu_write_reg(e, int(instr.rd), value)
+        }
+        case 0b101: {
+            value := u64(emu_read_u16(e, addr))
+            fmt.printf(" - lhu x%d, x%d, 0x%x\n", instr.rd, instr.rs1, instr.imm)
+            emu_write_reg(e, int(instr.rd), value)
+        }
+    }
+
+    return 4, true
+}
+
 emu_do_signed_arithmetic_instr :: proc(e: ^Emu64, instr: EmuInstructionIType32) -> (pc_offset: u64, cont: bool) {
+
+    fmt.printf(" - Arithmetic Group 0b%3b", instr.funct_3)
+
     switch instr.funct_3 {
         case 0b000: {
             value := i64(sign_extend_u16(instr.imm, 12))
             reg_value := i64(emu_read_reg(e, int(instr.rs1)))
             result := value + reg_value
 
-            fmt.eprintf(" - addi x%d, x%d, 0x%x (result: 0x%x)\n", instr.rd, instr.rs1, value, reg_value)
+            fmt.printf(" - addi x%d, x%d, 0x%x (result: 0x%x)\n", instr.rd, instr.rs1, value, result)
 
             emu_write_reg(e, int(instr.rd), u64(result))
 
@@ -818,7 +1536,17 @@ emu_do_signed_arithmetic_instr :: proc(e: ^Emu64, instr: EmuInstructionIType32) 
         case 0b011: {}
         case 0b100: {}
         case 0b110: {}
-        case 0b111: {}
+        case 0b111: {
+            value := i64(sign_extend_u16(instr.imm, 12))
+            reg_value := i64(emu_read_reg(e, int(instr.rs1)))
+            result := value & reg_value
+
+            fmt.printf(" - andi x%d, x%d, 0x%x (result: 0x%x)\n", instr.rd, instr.rs1, value, result)
+
+            emu_write_reg(e, int(instr.rd), u64(result))
+
+            return 4, true
+        }
     }
 
     return
