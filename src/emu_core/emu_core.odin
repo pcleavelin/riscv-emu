@@ -118,7 +118,7 @@ emu_set_break_point :: proc(e: ^Emu64, addr: u64) {
     append(&e.break_points, addr)
 }
 
-emu_load_elf :: proc(e: ^Emu64, file_path: string) -> (ok: bool) {
+emu_load_elf :: proc(e: ^Emu64, file_path: string) -> (start_addr: u64, ok: bool) {
     content, read_error := os.read_entire_file_from_path(file_path, context.allocator)
     if read_error != nil {
         fmt.println("error reading ELF:", read_error)
@@ -175,9 +175,7 @@ emu_load_elf :: proc(e: ^Emu64, file_path: string) -> (ok: bool) {
         }
     }
 
-    e.pc = entry_point_addr
-
-    return true
+    return entry_point_addr, true
 }
 
 emu_copy_into_mem :: proc(e: ^Emu64, src: []u8, dst_addr: u64) {
@@ -287,7 +285,13 @@ emu_get_page :: proc(e: ^Emu64, vaddr: u64) -> ^EmuMemoryPage {
     return page
 }
 
-emu_run_interactive :: proc(e: ^Emu64) {
+emu_run_addr :: proc(e: ^Emu64, addr: u64) {
+    e.pc = addr
+
+    emu_run(e)
+}
+
+emu_run :: proc(e: ^Emu64) {
     e.running = true
 
     for e.running {

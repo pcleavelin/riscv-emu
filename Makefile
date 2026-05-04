@@ -14,5 +14,5 @@ emu-hello-example:
 std-lib: stdlib/*.c stdlib/*.h stdlib/link.ld
 	mkdir -p bin
 	riscv64-none-elf-gcc -c stdlib/memops.S -ffreestanding -o bin/memops.o
-	riscv64-none-elf-gcc -c stdlib/stdlib.c -ffreestanding -o bin/stdlib.o
+	riscv64-none-elf-gcc -c stdlib/stdlib.c -ffreestanding -fPIC -o bin/stdlib.o
 	riscv64-none-elf-ld -T stdlib/link.ld bin/stdlib.o bin/memops.o -o bin/stdlib.elf

@@ -59,5 +59,5 @@ void free(void *ptr) { emu_trap(0xBAD7); }
 void _start() {
   // TODO: setup stack and interrupt handlers
 
-  // emu_println("hello world", 11);
+  emu_println("stdlib loaded\n", 14);
 }
