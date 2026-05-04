@@ -33,7 +33,6 @@ _start :: proc() {
     b := 0x2DEADDAD1BADBEEF
 
     println("Look at this cool number!")
-    println("Why does it print out the file path of fmt.odin?")
 
     hello_str := fmt.aprintf("Hello, World! 0x%x\n", b)
     println(hello_str)

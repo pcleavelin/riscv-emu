@@ -355,7 +355,6 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
 
     OP_ARITHMETIC_GROUP        :: 0b0110011
     OP_ARITHMETIC_64_GROUP     :: 0b0011011
-    OP_SHIFT_GROUP             :: 0b0010011 
     OP_BRANCH_GROUP            :: 0b1100011
     OP_STORE_GROUP             :: 0b0100011
     OP_LOAD_GROUP              :: 0b0000011
@@ -380,7 +379,7 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
     }
     else if instr.opcode.v == OP_LUI {
         // U-Type
-        imm := i64(instr.u_type.imm << 12)
+        imm := i64(i32(instr.u_type.imm << 12))
 
         fmt.printf(" - lui x%d, 0x%x\n", instr.u_type.rd, imm)
 
@@ -390,13 +389,13 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
     }
     else if instr.opcode.v == OP_AUIPC {
         // U-Type
-        imm := u64(instr.u_type.imm<<12)
+        imm := i64(i32(instr.u_type.imm<<12))
 
         result: u64
         if imm > 0 {
             result = e.pc + u64(imm)
         } else {
-            result = e.pc + u64(-imm)
+            result = e.pc - u64(-imm)
         }
 
         fmt.printf(" - auipc x%d <- (0x%x)\n", instr.u_type.rd, result)
@@ -405,153 +404,34 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
 
         return 4, true
     }
-    else if instr.opcode.v == OP_JALR || instr.opcode.v == OP_LOAD_GROUP || instr.opcode.v == 0b0010011 {
-        // I-Type or *R-Type
+    else if instr.opcode.v == OP_JALR || instr.opcode.v == OP_LOAD_GROUP || instr.opcode.v == 0b0010011  {
+        // I-Type
 
-        if instr.opcode.v == OP_SHIFT_GROUP {
-            // I-Type
+        // TODO
+        fmt.printf(" - Load and Math")
 
-            // TODO
-            fmt.printf(" - SHIFT_GROUP - 0b%3b", instr.i_type.funct_3)
+        switch instr.opcode.v {
+            case OP_JALR: {
+                rs1_i32 := i64(emu_read_reg(e, int(instr.i_type.rs1)))
+                imm_i32 := i64(sign_extend_u16(instr.i_type.imm, 12))
 
-            switch instr.r_type.funct_3 {
-                case 0b000: {
-                    rs1_val := emu_read_reg(e, int(instr.i_type.rs1))
+                addr := u64((rs1_i32 + imm_i32))&(~u64(1))
 
-                    result := i64(rs1_val) + i64(i16(sign_extend_u16(instr.i_type.imm, 12)))
+                fmt.printf(" - jalr x%d, 0x%x\n", instr.i_type.rs1, imm_i32)
 
-                    fmt.printf(" - addi x%d, x%d, 0x%x\n", instr.i_type.rd, instr.i_type.rs1, instr.i_type.imm)
+                emu_write_reg(e, int(instr.i_type.rd), e.pc + 4)
 
-                    emu_write_reg(e, int(instr.i_type.rd), u64(result))
-
-                    return 4, true
-                }
-                case 0b001: {
-                    rs1_val := emu_read_reg(e, int(instr.i_type.rs1))
-                    shamt := u64((instr.i_type.imm&0x3f))
-
-                    result := rs1_val << shamt
-
-                    fmt.printf(" - slli x%d, x%d, 0x%x\n", instr.i_type.rd, instr.i_type.rs1, shamt)
-
-                    emu_write_reg(e, int(instr.i_type.rd), result)
-
-                    return 4, true
-                }
-                case 0b010: {
-                    rs1_val := emu_read_reg(e, int(instr.i_type.rs1))
-                    imm := u64(instr.i_type.imm)
-
-                    fmt.printf(" - slti x%d, x%d, 0x%x\n", instr.i_type.rd, instr.i_type.rs1, instr.i_type.imm)
-
-                    if rs1_val < imm {
-                        emu_write_reg(e, int(instr.i_type.rd), 1)
-                    } else {
-                        emu_write_reg(e, int(instr.i_type.rd), 0)
-                    }
-
-                    return 4, true
-                }
-                case 0b011: {
-                    rs1_val := emu_read_reg(e, int(instr.i_type.rs1))
-                    imm := i64(i16(sign_extend_u16(instr.i_type.imm, 12)))
-
-                    fmt.printf(" - sltiu x%d, x%d, 0x%x\n", instr.i_type.rd, instr.i_type.rs1, instr.i_type.imm)
-
-                    if i64(rs1_val) < imm {
-                        emu_write_reg(e, int(instr.i_type.rd), 1)
-                    } else {
-                        emu_write_reg(e, int(instr.i_type.rd), 0)
-                    }
-
-                    return 4, true
-                }
-                case 0b100: {
-                    rs1_val := emu_read_reg(e, int(instr.i_type.rs1))
-                    imm := i64(i16(sign_extend_u16(instr.i_type.imm, 12)))
-
-                    fmt.printf(" - xori x%d, x%d, 0x%x\n", instr.i_type.rd, instr.i_type.rs1, instr.i_type.imm)
-
-                    result := i64(rs1_val) ~ imm
-
-                    emu_write_reg(e, int(instr.i_type.rd), u64(result))
-
-                    return 4, true
-                }
-                case 0b101: {
-                    rs1_val := emu_read_reg(e, int(instr.i_type.rs1))
-                    shamt := u64((instr.i_type.imm&0x3f))
-
-                    if (instr.i_type.imm>>26) > 0 {
-                        result := i64(rs1_val) >> shamt
-
-                        fmt.printf(" - srai x%d, x%d, 0x%x\n", instr.i_type.rd, instr.i_type.rs1, shamt)
-
-                        emu_write_reg(e, int(instr.i_type.rd), u64(result))
-                    } else {
-                        result := rs1_val >> shamt
-
-                        fmt.printf(" - srli x%d, x%d, 0x%x\n", instr.i_type.rd, instr.i_type.rs1, shamt)
-
-                        emu_write_reg(e, int(instr.i_type.rd), result)
-
-                        return 4, true
-                    }
-                }
-                case 0b110: {
-                    rs1_val := emu_read_reg(e, int(instr.i_type.rs1))
-                    imm := i64(i16(sign_extend_u16(instr.i_type.imm, 12)))
-
-                    fmt.printf(" - ori x%d, x%d, 0x%x\n", instr.i_type.rd, instr.i_type.rs1, instr.i_type.imm)
-
-                    result := i64(rs1_val) | imm
-
-                    emu_write_reg(e, int(instr.i_type.rd), u64(result))
-
-                    return 4, true
-                }
-                case 0b111: {
-                    rs1_val := emu_read_reg(e, int(instr.i_type.rs1))
-                    imm := i64(i16(sign_extend_u16(instr.i_type.imm, 12)))
-
-                    fmt.printf(" - andi x%d, x%d, 0x%x\n", instr.i_type.rd, instr.i_type.rs1, instr.i_type.imm)
-
-                    result := i64(rs1_val) & imm
-
-                    emu_write_reg(e, int(instr.i_type.rd), u64(result))
-
-                    return 4, true
-                }
+                return emu_instr_jump(e, addr)
             }
-        } else {
-            // I-Type
-
-            // TODO
-            fmt.printf(" - Load and Math")
-
-            switch instr.opcode.v {
-                case OP_JALR: {
-                    rs1_i32 := i32(emu_read_reg(e, int(instr.i_type.rs1))&0xFFFFFFFF)
-                    imm_i32 := i32(sign_extend_u16(instr.i_type.imm, 12))
-
-                    addr := u64(i64(rs1_i32 + imm_i32))&0xFFFFFFFFFFFFFFFE
-
-                    fmt.printf(" - jalr x%d, 0x%x\n", instr.i_type.rs1, imm_i32)
-
-                    emu_write_reg(e, int(instr.i_type.rd), e.pc + 4)
-
-                    return emu_instr_jump(e, addr)
-                }
-                case OP_LOAD_GROUP: {
-                    return emu_do_load_instr(e, instr.i_type)
-                }
-                case OP_SIGNED_ARITHMETIC_GROUP: {
-                    return emu_do_signed_arithmetic_instr(e, instr.i_type)
-                }
+            case OP_LOAD_GROUP: {
+                return emu_do_load_instr(e, instr.i_type)
             }
-
-            fmt.printf("\n")
+            case OP_SIGNED_ARITHMETIC_GROUP: {
+                return emu_do_signed_arithmetic_instr(e, instr.i_type)
+            }
         }
+
+        fmt.printf("\n")
     }
     else if instr.opcode.v == OP_ARITHMETIC_GROUP {
         // R-Type
@@ -563,13 +443,25 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
                 rs2_val := emu_read_reg(e, int(instr.r_type.rs2))
 
                 result: u64
-                if instr.r_type.funct_7 > 0 {
-                    result = rs1_val - rs2_val
 
-                    fmt.printf(" - sub x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
-                } else {
-                    result = rs1_val + rs2_val
-                    fmt.printf(" - add x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
+                switch instr.r_type.funct_7 {
+                    case 0b0000000: {
+                        result = rs1_val + rs2_val
+                        fmt.printf(" - add x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
+                    }
+                    case 0b0100000: {
+                        result = rs1_val - rs2_val
+
+                        fmt.printf(" - sub x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
+                    }
+                    case 0b0000001: {
+                        result = rs1_val * rs2_val
+
+                        fmt.printf(" - mul x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
+                    }
+                    case: {
+                        return 0, false
+                    }
                 }
 
                 emu_write_reg(e, int(instr.r_type.rd), result)
@@ -578,7 +470,7 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
             }
             case 0b001: {
                 rs1_val := emu_read_reg(e, int(instr.r_type.rs1))
-                rs2_val := emu_read_reg(e, int(instr.r_type.rs1))&0x1f
+                rs2_val := emu_read_reg(e, int(instr.r_type.rs2))&0x3f
 
                 result := rs1_val << rs2_val
 
@@ -619,20 +511,31 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
             case 0b100: {}
             case 0b101: {
                 rs1_val := emu_read_reg(e, int(instr.r_type.rs1))
-                rs2_val := emu_read_reg(e, int(instr.r_type.rs1))&0x1f
+                rs2_val := emu_read_reg(e, int(instr.r_type.rs2))&0x3f
 
-                result: i64
-                if instr.r_type.funct_7 > 0 {
-                    result = i64(rs1_val) >> rs2_val
+                result: u64
+                switch instr.r_type.funct_7 {
+                    case 0b0000000: {
+                        result = rs1_val >> rs2_val
 
-                    fmt.printf(" - srl x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
-                } else {
-                    result = i64(rs1_val) >> rs2_val
+                        fmt.printf(" - srl x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
+                    }
+                    case 0b0100000: {
+                        result = u64(i64(rs1_val) >> rs2_val)
 
-                    fmt.printf(" - sra x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
+                        fmt.printf(" - sra x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
+                    }
+                    case 0b0000001: {
+                        result = rs1_val / rs2_val
+
+                        fmt.printf(" - divu x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
+                    }
+                    case: {
+                        return 0, false
+                    }
                 }
 
-                emu_write_reg(e, int(instr.r_type.rd), u64(result))
+                emu_write_reg(e, int(instr.r_type.rd), result)
 
                 return 4, true
             }
@@ -643,9 +546,24 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
 
                 fmt.printf(" - and x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
 
-                rd_val := rs1_val & rs2_val
+                result: u64
+                switch instr.r_type.funct_7 {
+                    case 0b0000000: {
+                        result = rs1_val & rs2_val
 
-                emu_write_reg(e, int(instr.r_type.rd), rd_val)
+                        fmt.printf(" - and x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
+                    }
+                    case 0b0000001: {
+                        result = rs1_val % rs2_val
+
+                        fmt.printf(" - remu x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
+                    }
+                    case: {
+                        return 0, false
+                    }
+                }
+
+                emu_write_reg(e, int(instr.r_type.rd), result)
 
                 return 4, true
             }
@@ -925,7 +843,7 @@ emu_do_rvc_q0 :: proc(e: ^Emu64, instr: u16) -> (pc_offset: u64, cont: bool) {
             imm_2 := (instr>>10)&0b111
 
             // FIXME
-            imm := u64(((imm_1&0x1)<<6) | ((imm_1&0b10)<<2) | (imm_2<<3))
+            imm := u64(((imm_1&0x1)<<6) | ((imm_1&0b10)<<1) | (imm_2<<3))
 
             reg_value := emu_read_reg_cext(e, int(rs1))
             addr := reg_value + imm
@@ -1340,8 +1258,10 @@ emu_do_rvc_q2 :: proc(e: ^Emu64, instr: u16) -> (pc_offset: u64, cont: bool) {
             if bit_12 {
                 if input_2 != 0 {
                     if input_1 == 0 {
+                        reg := emu_read_reg(e, int(input_2))
+
                         emu_write_reg(e, int(1), e.pc+2)
-                        e.pc = emu_read_reg(e, int(input_2))
+                        e.pc = reg
 
                         fmt.printf(" - c.jalr x%d\n", input_2)
 
@@ -1383,16 +1303,14 @@ emu_do_rvc_q2 :: proc(e: ^Emu64, instr: u16) -> (pc_offset: u64, cont: bool) {
             rs2   := (instr>>2)&0x1F // 5bit
             imm_1 := u32((instr>>7)&0x3F) // 6bit
 
-            // FIXME: is this necessary? is it already scaled by 8?
-            // Unscramble the encoding (offset[5:3|8:6])
-            imm: = u64(unscramble_imm(imm_1, { 5,4,3,2,7,6 }))//*8
+            // Unscramble the encoding (offset[5:2|8:6])
+            imm: = u64(unscramble_imm(imm_1, { 5,4,3,2,7,6 }))
 
             addr := imm + emu_read_reg(e, REG_X2)
-            reg_value := f32(u32(emu_read_reg(e, int(rs2))&0xFFFFFFFF))
 
-            fmt.printf(" - c.fswsp x%d (0x%x)\n", rs2, imm)
+            fmt.printf(" - c.swsp x%d (0x%x)\n", rs2, addr)
 
-            emu_write_u64(e, addr, u64(reg_value))
+            emu_write_u32(e, addr, u32(emu_read_reg(e, int(rs2))&0xFFFFFFFF))
 
             return 2, true
         }
@@ -1522,26 +1440,107 @@ emu_do_signed_arithmetic_instr :: proc(e: ^Emu64, instr: EmuInstructionIType32) 
 
     switch instr.funct_3 {
         case 0b000: {
-            value := i64(sign_extend_u16(instr.imm, 12))
-            reg_value := i64(emu_read_reg(e, int(instr.rs1)))
-            result := value + reg_value
+            rs1_val := emu_read_reg(e, int(instr.rs1))
 
-            fmt.printf(" - addi x%d, x%d, 0x%x (result: 0x%x)\n", instr.rd, instr.rs1, value, result)
+            result := i64(rs1_val) + i64(i16(sign_extend_u16(instr.imm, 12)))
+
+            fmt.printf(" - addi x%d, x%d, 0x%x\n", instr.rd, instr.rs1, instr.imm)
 
             emu_write_reg(e, int(instr.rd), u64(result))
 
             return 4, true
         }
-        case 0b010: {}
-        case 0b011: {}
-        case 0b100: {}
-        case 0b110: {}
-        case 0b111: {
-            value := i64(sign_extend_u16(instr.imm, 12))
-            reg_value := i64(emu_read_reg(e, int(instr.rs1)))
-            result := value & reg_value
+        case 0b001: {
+            rs1_val := emu_read_reg(e, int(instr.rs1))
+            shamt := u64((instr.imm&0x3f))
 
-            fmt.printf(" - andi x%d, x%d, 0x%x (result: 0x%x)\n", instr.rd, instr.rs1, value, result)
+            result := rs1_val << shamt
+
+            fmt.printf(" - slli x%d, x%d, 0x%x\n", instr.rd, instr.rs1, shamt)
+
+            emu_write_reg(e, int(instr.rd), result)
+
+            return 4, true
+        }
+        case 0b010: {
+            rs1_val := emu_read_reg(e, int(instr.rs1))
+            imm := i64(i16(sign_extend_u16(instr.imm, 12)))
+
+            fmt.printf(" - slti x%d, x%d, 0x%x\n", instr.rd, instr.rs1, instr.imm)
+
+            if i64(rs1_val) < imm {
+                emu_write_reg(e, int(instr.rd), 1)
+            } else {
+                emu_write_reg(e, int(instr.rd), 0)
+            }
+
+            return 4, true
+        }
+        case 0b011: {
+            rs1_val := emu_read_reg(e, int(instr.rs1))
+            imm := u64(i64(i16(sign_extend_u16(instr.imm, 12))))
+
+            fmt.printf(" - sltiu x%d, x%d, 0x%x\n", instr.rd, instr.rs1, instr.imm)
+
+            if rs1_val < imm {
+                emu_write_reg(e, int(instr.rd), 1)
+            } else {
+                emu_write_reg(e, int(instr.rd), 0)
+            }
+
+            return 4, true
+        }
+        case 0b100: {
+            rs1_val := emu_read_reg(e, int(instr.rs1))
+            imm := i64(i16(sign_extend_u16(instr.imm, 12)))
+
+            fmt.printf(" - xori x%d, x%d, 0x%x\n", instr.rd, instr.rs1, instr.imm)
+
+            result := i64(rs1_val) ~ imm
+
+            emu_write_reg(e, int(instr.rd), u64(result))
+
+            return 4, true
+        }
+        case 0b101: {
+            rs1_val := emu_read_reg(e, int(instr.rs1))
+            shamt := u64((instr.imm&0x3f))
+
+            if ((instr.imm>>10)&1) > 0 {
+                result := i64(rs1_val) >> shamt
+
+                fmt.printf(" - srai x%d, x%d, 0x%x\n", instr.rd, instr.rs1, shamt)
+
+                emu_write_reg(e, int(instr.rd), u64(result))
+            } else {
+                result := rs1_val >> shamt
+
+                fmt.printf(" - srli x%d, x%d, 0x%x\n", instr.rd, instr.rs1, shamt)
+
+                emu_write_reg(e, int(instr.rd), result)
+            }
+
+            return 4, true
+        }
+        case 0b110: {
+            rs1_val := emu_read_reg(e, int(instr.rs1))
+            imm := i64(i16(sign_extend_u16(instr.imm, 12)))
+
+            fmt.printf(" - ori x%d, x%d, 0x%x\n", instr.rd, instr.rs1, instr.imm)
+
+            result := i64(rs1_val) | imm
+
+            emu_write_reg(e, int(instr.rd), u64(result))
+
+            return 4, true
+        }
+        case 0b111: {
+            rs1_val := emu_read_reg(e, int(instr.rs1))
+            imm := i64(i16(sign_extend_u16(instr.imm, 12)))
+
+            fmt.printf(" - andi x%d, x%d, 0x%x\n", instr.rd, instr.rs1, instr.imm)
+
+            result := i64(rs1_val) & imm
 
             emu_write_reg(e, int(instr.rd), u64(result))
 

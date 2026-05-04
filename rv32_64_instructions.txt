@@ -77,6 +77,15 @@ imm[11:5]                rs2 rs1 011 imm[4:0] 0100011 SD
 0000000                        rs2 rs1 110 rd 0110011 OR
 0000000                        rs2 rs1 111 rd 0110011 AND
 
+0000001                        rs2 rs1 000 rd 0110011 MUL
+0000001                        rs2 rs1 001 rd 0110011 MULH
+0000001                        rs2 rs1 010 rd 0110011 MULHSU
+0000001                        rs2 rs1 011 rd 0110011 MULHU
+0000001                        rs2 rs1 100 rd 0110011 DIV
+0000001                        rs2 rs1 101 rd 0110011 DIVU
+0000001                        rs2 rs1 110 rd 0110011 REM
+0000001                        rs2 rs1 111 rd 0110011 REMU
+
 fm						pred succ rs1 000 rd 0001111 FENCE
 1000						0011 0011 00000 000 00000 0001111 FENCE.TSO
 0000						0001 0000 00000 000 00000 0001111 PAUSE
