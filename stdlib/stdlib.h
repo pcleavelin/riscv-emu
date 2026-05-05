@@ -14,8 +14,20 @@ typedef int16_t S16;
 typedef int32_t S32;
 typedef int64_t S64;
 
+typedef struct {
+  U8 *data;
+  U32 len;
+} String8;
+
 void emu_syscall();
 void emu_println(U8 *buf, U64 len);
+void emu_out_call_host_fn(U8 *buf, U64 len);
+
+void emu_out_push_u32(U32 value);
+void emu_out_push_ptr(U64 value);
+
+U32 emu_out_pop_u32();
+U64 emu_out_pop_ptr();
 
 U8 *memset(U8 *ptr, int value, size_t num);
 void *memmove(void *destination, const void *source, size_t num);

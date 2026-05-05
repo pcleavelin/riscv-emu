@@ -8,6 +8,12 @@ import "core:math/bits"
 
 REG_X2 :: 2
 
+EmuFunction :: struct {
+    name: string,
+    addr: u64,
+    size: u64,
+}
+
 Emu64 :: struct {
     reg: [31]u64,
     pc: u64,
@@ -15,6 +21,9 @@ Emu64 :: struct {
     page_table: EmuPageTable,
 
     break_points: [dynamic]u64,
+    functions: [dynamic]EmuFunction,
+    comm_stack: [32]EmuValue,
+    comm_stack_num: int,
 
     running: bool,
 }
@@ -175,6 +184,89 @@ emu_load_elf :: proc(e: ^Emu64, file_path: string) -> (start_addr: u64, ok: bool
         }
     }
 
+    // Parse section headers to find .symtab and .strtab
+    e_shoff_loc     :: 0x28
+    e_shentsize_loc :: 0x3A
+    e_shnum_loc     :: 0x3C
+    e_shstrndx_loc  :: 0x3E
+
+    sh_offset := (transmute(^u64)(&content[e_shoff_loc]))^
+    sh_entsize := u64((transmute(^u16)(&content[e_shentsize_loc]))^)
+    sh_num := u64((transmute(^u16)(&content[e_shnum_loc]))^)
+
+    // Section header field offsets
+    sh_type_off    :: u64(0x04)
+    sh_offset_off  :: u64(0x18)
+    sh_size_off    :: u64(0x20)
+    sh_link_off    :: u64(0x28)
+
+    SHT_SYMTAB :: u32(2)
+
+    symtab_offset: u64
+    symtab_size: u64
+    symtab_link: u64 // index of associated strtab section
+    found_symtab := false
+
+    for i in 0..<sh_num {
+        sec := sh_offset + i * sh_entsize
+        s_type := (transmute(^u32)(&content[sec + sh_type_off]))^
+        if s_type == SHT_SYMTAB {
+            symtab_offset = (transmute(^u64)(&content[sec + sh_offset_off]))^
+            symtab_size   = (transmute(^u64)(&content[sec + sh_size_off]))^
+            symtab_link   = u64((transmute(^u32)(&content[sec + sh_link_off]))^)
+            found_symtab = true
+            break
+        }
+    }
+
+    if found_symtab {
+        // Get strtab section
+        strtab_sec := sh_offset + symtab_link * sh_entsize
+        strtab_offset := (transmute(^u64)(&content[strtab_sec + sh_offset_off]))^
+        strtab_size   := (transmute(^u64)(&content[strtab_sec + sh_size_off]))^
+        strtab := content[strtab_offset:strtab_offset + strtab_size]
+
+        // ELF64 symbol entry: 24 bytes
+        // st_name  (0x00, u32) - index into strtab
+        // st_info  (0x04, u8)  - type and binding
+        // st_other (0x05, u8)
+        // st_shndx (0x06, u16)
+        // st_value (0x08, u64) - address
+        // st_size  (0x10, u64) - size
+        SYM_ENTRY_SIZE :: u64(24)
+        STT_FUNC :: u8(2)
+
+        num_syms := symtab_size / SYM_ENTRY_SIZE
+        for i in 0..<num_syms {
+            sym := symtab_offset + i * SYM_ENTRY_SIZE
+            st_name  := (transmute(^u32)(&content[sym + 0x00]))^
+            st_info  := content[sym + 0x04]
+            st_value := (transmute(^u64)(&content[sym + 0x08]))^
+            st_size  := (transmute(^u64)(&content[sym + 0x10]))^
+
+            // Only track functions (lower 4 bits of st_info == STT_FUNC)
+            if (st_info & 0xf) == STT_FUNC && st_value != 0 {
+                // Find null-terminated string in strtab
+                name_start := u64(st_name)
+                name_end := name_start
+                for name_end < u64(len(strtab)) && strtab[name_end] != 0 {
+                    name_end += 1
+                }
+                name := string(strtab[name_start:name_end])
+
+                append(&e.functions, EmuFunction{
+                    name = name,
+                    addr = st_value,
+                    size = st_size,
+                })
+            }
+        }
+
+        for f in e.functions {
+            fmt.printf("loaded '%s'\n", f.name)
+        }
+    }
+
     return entry_point_addr, true
 }
 
@@ -283,6 +375,80 @@ emu_get_page :: proc(e: ^Emu64, vaddr: u64) -> ^EmuMemoryPage {
     }
 
     return page
+}
+
+EmuValue :: union {
+    EmuArgU32,
+    EmuArgU64,
+}
+
+EmuArgU32    :: distinct u32
+EmuArgU64    :: distinct u64
+
+emu_run_function :: proc(e: ^Emu64, fn: string, args: ..EmuValue) {
+    emu_comm_stack_clear(e)
+
+    for arg in args {
+        emu_comm_stack_push(e, arg)
+    }
+
+    for f in e.functions {
+        if f.name == fn {
+            emu_run_addr(e, f.addr)
+            break
+        }
+    }
+
+    result, ok := emu_comm_stack_pop(e)
+    if !ok do return
+
+    fmt.eprintln("result from emu func: %v", result)
+
+    return
+}
+
+emu_comm_stack_clear :: proc(e: ^Emu64) {
+    e.comm_stack_num = 0
+}
+
+emu_comm_stack_push :: proc(e: ^Emu64, arg: EmuValue) {
+    e.comm_stack[e.comm_stack_num] = arg
+    e.comm_stack_num += 1
+}
+
+emu_comm_stack_pop_u32 :: proc(e: ^Emu64) -> (value: u32, ok: bool) {
+    emu_value := emu_comm_stack_pop(e) or_return
+
+    #partial switch v in emu_value {
+        case EmuArgU32: {
+            return u32(v), true
+        }
+    }
+
+    return
+}
+
+emu_comm_stack_pop_u64 :: proc(e: ^Emu64) -> (value: u64, ok: bool) {
+    emu_value := emu_comm_stack_pop(e) or_return
+
+    #partial switch v in emu_value {
+        case EmuArgU64: {
+            return u64(v), true
+        }
+    }
+
+    return
+}
+
+emu_comm_stack_pop :: proc(e: ^Emu64) -> (value: EmuValue, ok: bool) {
+    if e.comm_stack_num > 0 {
+        value = e.comm_stack[e.comm_stack_num-1]
+        e.comm_stack_num -= 1
+
+        return value, true
+    } else {
+        return
+    }
 }
 
 emu_run_addr :: proc(e: ^Emu64, addr: u64) {
@@ -558,7 +724,7 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
                         fmt.printf(" - and x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
                     }
                     case 0b0000001: {
-                        result = rs1_val % rs2_val
+                        result = rs1_val %% rs2_val
 
                         fmt.printf(" - remu x%d, x%d, x%d\n", instr.r_type.rd, instr.r_type.rs1, instr.r_type.rs2)
                     }
@@ -570,6 +736,9 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
                 emu_write_reg(e, int(instr.r_type.rd), result)
 
                 return 4, true
+            }
+            case: {
+                return
             }
         }
 
@@ -661,6 +830,9 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
                     return emu_instr_jump_rel(e, offset)
                 }
             }
+            case: {
+                return
+            }
         }
 
         return 4, true
@@ -684,12 +856,16 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
                 emu_write_u16(e, addr, u16(rs2_val&0xFFFF))
             }
             case 0b010: {
-                fmt.printf(" - sw x%d, x%d, 0x%x\n", instr.s_type.rs1, instr.s_type.rs2, imm)
+                fmt.printf(" - sw x%d, x%d, 0x%x", instr.s_type.rs1, instr.s_type.rs2, imm)
                 emu_write_u32(e, addr, u32(rs2_val&0xFFFFFFFF))
+                fmt.printf(" - (result in mem: 0x%x)\n", emu_read_u64(e, addr))
             }
             case 0b011: {
                 fmt.printf(" - sd x%d, x%d, 0x%x\n", instr.s_type.rs1, instr.s_type.rs2, imm)
                 emu_write_u64(e, addr, rs2_val)
+            }
+            case: {
+                return
             }
         }
 
@@ -700,10 +876,16 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
         // a7 (x15) syscall id
         // a0-a? (x8-x?) arguments
 
-        SYS_TRAP    :: 0xFF
-        SYS_PRINTLN :: 0xA
+        SYS_TRAP             :: 0xFF
+        SYS_PRINTLN          :: 0x0A
+        SYS_CALL_HOST        :: 0x0B
+        SYS_PUSH_STACK       :: 0x02
+        SYS_POP_STACK        :: 0x03
 
-        SYS_LINUX_WRITE :: 0x40
+        SYS_STACK_FN_U32     :: 0x01
+        SYS_STACK_FN_POINTER :: 0x02
+
+        SYS_LINUX_WRITE      :: 0x40
 
         sys_call_id := emu_read_reg(e, 17)
 
@@ -750,6 +932,82 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
 
                 fmt.eprintf("%v", str)
                 // fmt.eprintf("\nSYS_PRINTLN: %v\n\n", str)
+            }
+            case SYS_CALL_HOST: {
+                func_name_addr := emu_read_reg(e, 10)
+                func_name_len := emu_read_reg(e, 11)
+
+                read_emu_string :: proc(e: ^Emu64, addr: u64, len: u64) -> string {
+
+                    buf := make([]u8, len, allocator = context.temp_allocator)
+                    for i in 0..<len {
+                        buf[i] = emu_read_u8(e, addr+i)
+                    }
+                    return string(buf)
+                }
+
+                func_name := read_emu_string(e, func_name_addr, func_name_len)
+
+                if func_name == "core::println" {
+                    str_addr := emu_comm_stack_pop_u64(e) or_break
+                    str_len := emu_comm_stack_pop_u32(e) or_break
+
+                    str := read_emu_string(e, str_addr, u64(str_len))
+                    fmt.eprintf("%v", str)
+                } else {
+                    fmt.eprintf("\nInvalid CALL_HOST function: %s\n\n", func_name)
+                }
+            }
+            case SYS_PUSH_STACK: {
+                func := emu_read_reg(e, 10)
+                value := emu_read_reg(e, 11)
+
+                switch func {
+                    case SYS_STACK_FN_U32: {
+                        emu_comm_stack_push(e, EmuArgU32(i32(value&0xFFFFFFFF)))
+                    }
+                    case SYS_STACK_FN_POINTER: {
+                        emu_comm_stack_push(e, EmuArgU64(u64(value)))
+                    }
+                    case: {
+                        fmt.eprintf("\nInvalid PUSH_STACK function: 0x%x\n\n", func)
+                    }
+                }
+            }
+            case SYS_POP_STACK: {
+                func := emu_read_reg(e, 10)
+                value, ok := emu_comm_stack_pop(e)
+                if !ok {
+                    fmt.eprintf("\nInvalid POP_STACK call: nothing on the stack\n\n")
+                    return 4, true
+                } 
+
+                switch func {
+                    case SYS_STACK_FN_U32: {
+                        switch v in value {
+                            case EmuArgU32: {
+                                emu_write_reg(e, 10, u64(u32(v)))
+                            }
+                            case EmuArgU64: {
+                                fmt.eprintf("\nInvalid POP_STACK call: invalid type, emu wanted U32, got U64\n\n")
+                            }
+                        }
+
+                    }
+                    case SYS_STACK_FN_POINTER: {
+                        switch v in value {
+                            case EmuArgU32: {
+                                fmt.eprintf("\nInvalid POP_STACK call: invalid type, emu wanted U64, got U32\n\n")
+                            }
+                            case EmuArgU64: {
+                                emu_write_reg(e, 10, u64(v))
+                            }
+                        }
+                    }
+                    case: {
+                        fmt.eprintf("\nInvalid POP_STACK function: 0x%x\n\n", func)
+                    }
+                }
             }
             case: {
                 fmt.eprintf("\nInvalid SYSCALL 0x%x\n\n", sys_call_id)
@@ -1433,6 +1691,14 @@ emu_do_load_instr :: proc(e: ^Emu64, instr: EmuInstructionIType32) -> (pc_offset
             fmt.printf(" - lhu x%d, x%d, 0x%x\n", instr.rd, instr.rs1, instr.imm)
             emu_write_reg(e, int(instr.rd), value)
         }
+        case 0b110: {
+            value := u64(emu_read_u32(e, addr))
+            fmt.printf(" - lwu x%d, x%d, 0x%x\n", instr.rd, instr.rs1, instr.imm)
+            emu_write_reg(e, int(instr.rd), value)
+        }
+        case: {
+            return
+        }
     }
 
     return 4, true
@@ -1550,6 +1816,9 @@ emu_do_signed_arithmetic_instr :: proc(e: ^Emu64, instr: EmuInstructionIType32) 
 
             return 4, true
         }
+        case: {
+            return
+        }
     }
 
     return
@@ -1567,4 +1836,3 @@ sign_extend_Test :: proc(t: ^testing.T) {
     testing.expect_value(t, num_8bit_signed, -2)
     testing.expect_value(t, num_16bit_signed, -2)
 }
-
