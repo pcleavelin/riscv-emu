@@ -10,8 +10,8 @@ import emu "../../bindings/odin"
 
 @(export)
 plugin_start :: proc() {
-    b :u64= 0xfDEADDAD1BADBEEF
+    input := emu.readln()
 
-    hello_str := fmt.aprintf("Hello, World! 0x%x\n", b)
-    emu.print(hello_str)
+    str := fmt.aprintf("You typed in: '%s'\n", input)
+    emu.print(str)
 }

@@ -6,4 +6,4 @@ hello: hello_obj
 hello_obj:
 	mkdir -p out
 	-rm out/*.o
-	odin build . -target:linux_riscv64 -build-mode:object -default-to-nil-allocator -no-thread-local -no-rpath -no-entry-point -o:none -out:out/hello.o
+	odin build . -target:freestanding_riscv64 -build-mode:object -default-to-nil-allocator -no-thread-local -no-rpath -no-crt -o:none -out:out/hello.o

@@ -40,26 +40,14 @@
         devShell = pkgs.mkShell {
           buildInputs = with pkgs; (if pkgs.system == "aarch64-darwin" || pkgs.system == "x86_64-darwin" then [
             git
-            local-rust
             pkgsCross.riscv64-embedded.buildPackages.gcc
             odin
             ols
-            binutils
             clang
           ] else if pkgs.system == "x86_64-linux" then [
-            pkg-config
-            binutils
+            pkgsCross.riscv64-embedded.buildPackages.gcc
             odin
             ols
-            local-rust
-            libGL
-            xorg.libX11
-            xorg.libXi
-            xorg.xinput
-            xorg.libXcursor
-            xorg.libXrandr
-            xorg.libXinerama
-            pkgs.nixgl.nixGLIntel
           ] else throw "unsupported system" );
         };
 

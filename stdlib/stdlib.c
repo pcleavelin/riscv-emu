@@ -18,7 +18,7 @@ static void emu_trap(U16 code) {
   asm volatile("ecall" : "+r"(a0) : "r"(a7) : "memory");
 }
 
-void emu_println(U8 *buf, U64 len) {
+void emu_println(const U8 *buf, U64 len) {
   register U64 a7 asm("x17") = SYS_PRINTLN;
   register U64 a0 asm("x10") = (U64)buf;
   register U64 a1 asm("x11") = len;
@@ -26,7 +26,7 @@ void emu_println(U8 *buf, U64 len) {
   asm volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a7) : "memory");
 }
 
-void emu_out_call_host_fn(U8 *buf, U64 len) {
+void emu_out_call_host_fn(const U8 *buf, U64 len) {
   register U64 a7 asm("x17") = SYS_CALL_HOST;
   register U64 a0 asm("x10") = (U64)buf;
   register U64 a1 asm("x11") = len;
@@ -41,7 +41,7 @@ void emu_out_push_u32(U32 value) {
 
   asm volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a7));
 }
-void emu_out_push_ptr(U64 value) {
+void emu_out_push_u64(U64 value) {
   register U64 a7 asm("x17") = SYS_PUSH_STACK;
   register U64 a0 asm("x10") = SYS_PUSH_FN_POINTER;
   register U64 a1 asm("x11") = value;
@@ -58,13 +58,27 @@ U32 emu_out_pop_u32() {
   return a0;
 }
 
-U64 emu_out_pop_ptr() {
+U64 emu_out_pop_u64() {
   register U64 a7 asm("x17") = SYS_POP_STACK;
   register U64 a0 asm("x10") = SYS_PUSH_FN_POINTER;
 
   asm volatile("ecall" : "+r"(a0) : "r"(a7) : "memory");
 
   return a0;
+}
+
+U8 emu_in_read_line(U8 **buf, U64 *len) {
+    const U8 func_name[] = "core::readln";
+
+    emu_out_call_host_fn(func_name, sizeof(func_name)-1);
+
+    U8 *popped_buf = (U8 *)emu_out_pop_u64();
+    if (buf == 0) return 1;
+
+    *len = emu_out_pop_u64();
+    *buf = popped_buf;
+
+    return 0;
 }
 
 void *malloc(size_t size) {
@@ -81,8 +95,3 @@ void *realloc(void *ptr, size_t size) {
 }
 void free(void *ptr) { emu_trap(0xBAD7); }
 
-void _start() {
-  // TODO: setup stack and interrupt handlers
-
-  emu_println("stdlib loaded\n", 14);
-}

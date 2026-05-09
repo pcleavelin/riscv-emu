@@ -21,7 +21,7 @@ Emu64 :: struct {
     page_table: EmuPageTable,
 
     break_points: [dynamic]u64,
-    functions: [dynamic]EmuFunction,
+    functions: map[string]EmuFunction,
     comm_stack: [32]EmuValue,
     comm_stack_num: int,
 
@@ -107,6 +107,7 @@ EmuInstructionJType32 :: bit_field u32 {
 emu_make :: proc(max_memory: int) -> Emu64 {
     return Emu64 {
         page_table = emu_make_page_table(1024 * 16),
+        functions = make(map[string]EmuFunction)
     }
 }
 
@@ -254,16 +255,12 @@ emu_load_elf :: proc(e: ^Emu64, file_path: string) -> (start_addr: u64, ok: bool
                 }
                 name := string(strtab[name_start:name_end])
 
-                append(&e.functions, EmuFunction{
+                e.functions[name] = EmuFunction {
                     name = name,
                     addr = st_value,
                     size = st_size,
-                })
+                }
             }
-        }
-
-        for f in e.functions {
-            fmt.printf("loaded '%s'\n", f.name)
         }
     }
 
@@ -392,17 +389,16 @@ emu_run_function :: proc(e: ^Emu64, fn: string, args: ..EmuValue) {
         emu_comm_stack_push(e, arg)
     }
 
-    for f in e.functions {
-        if f.name == fn {
-            emu_run_addr(e, f.addr)
-            break
-        }
+    if f, ok := e.functions[fn]; ok {
+        emu_run_addr(e, f.addr)
+    } else {
+        fmt.eprintln("couldn't find function")
     }
 
     result, ok := emu_comm_stack_pop(e)
     if !ok do return
 
-    fmt.eprintln("result from emu func: %v", result)
+    fmt.eprintf("result from emu func: 0x%x\n", result)
 
     return
 }
@@ -948,12 +944,21 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
 
                 func_name := read_emu_string(e, func_name_addr, func_name_len)
 
+                // TODO: allow users of lib to define these
                 if func_name == "core::println" {
                     str_addr := emu_comm_stack_pop_u64(e) or_break
                     str_len := emu_comm_stack_pop_u32(e) or_break
 
                     str := read_emu_string(e, str_addr, u64(str_len))
                     fmt.eprintf("%v", str)
+                } else if func_name == "core::readln" {
+                    buf := "test input"
+                    for i in 0..<len(buf) {
+                        emu_write_u8(e, 0x800000000+u64(i), buf[i])
+                    }
+
+                    emu_comm_stack_push(e, EmuArgU64(len(buf)))
+                    emu_comm_stack_push(e, EmuArgU64(0x800000000))
                 } else {
                     fmt.eprintf("\nInvalid CALL_HOST function: %s\n\n", func_name)
                 }
@@ -980,7 +985,7 @@ emu_do_rv64 :: proc(e: ^Emu64) -> (pc_offset: u64, cont: bool) {
                 if !ok {
                     fmt.eprintf("\nInvalid POP_STACK call: nothing on the stack\n\n")
                     return 4, true
-                } 
+                }
 
                 switch func {
                     case SYS_STACK_FN_U32: {
