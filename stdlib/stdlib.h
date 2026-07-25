@@ -20,6 +20,7 @@ typedef struct {
 } String8;
 
 void emu_syscall();
+void emu_shutdown(void);
 void emu_println(const U8 *buf, U64 len);
 void emu_out_call_host_fn(const U8 *buf, U64 len);
 

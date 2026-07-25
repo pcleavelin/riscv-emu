@@ -1,4 +1,11 @@
-all: emu-gui std-lib examples
+all: emu-gui std-lib emu_os
+
+emu_os:
+	mkdir -p os/bin
+	-rm os/bin/*.o
+	-rm os/bin/*.elf
+	odin build os/bootloader.odin -file -define:EMU_DEFAULT_START=false -target:freestanding_riscv64 -build-mode:object -default-to-nil-allocator -no-thread-local -no-rpath -no-crt -o:none -out:os/bin/bootloader.o
+	riscv64-none-elf-ld -T os/bootloader.ld os/bin/bootloader-* --just-symbols bin/stdlib.elf -o os/bin/bootloader.elf
 
 examples: emu-hello-example emu-host-to-guest-example
 
@@ -12,8 +19,9 @@ emu-core-tests: src/*.odin
 
 std-lib: stdlib/*.c stdlib/*.h stdlib/link.ld
 	mkdir -p bin
+	-rm bin/*.o
 	riscv64-none-elf-gcc -c stdlib/memops.S -ffreestanding -o bin/memops.o
-	riscv64-none-elf-gcc -c stdlib/stdlib.c -ffreestanding -fPIC -o bin/stdlib.o
+	riscv64-none-elf-gcc -c stdlib/stdlib.c -ffreestanding -fPIC -fno-builtin -o bin/stdlib.o
 	riscv64-none-elf-ld -T stdlib/link.ld bin/stdlib.o bin/memops.o -o bin/stdlib.elf
 
 emu-hello-example:

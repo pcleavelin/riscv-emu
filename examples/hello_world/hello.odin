@@ -8,8 +8,9 @@ import "core:strings"
 
 import emu "../../bindings/odin"
 
-@(export)
-plugin_start :: proc() {
+main :: proc "contextless" () {
+    context = emu.EMU_CONTEXT
+
     b :u64= 0xfDEADDAD1BADBEEF
 
     hello_str := fmt.aprintf("Hello, World! 0x%x\n", b)

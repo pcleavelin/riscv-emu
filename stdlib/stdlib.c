@@ -1,6 +1,8 @@
 #include "stdlib.h"
 
+#define SYS_SHUTDOWN 0xFE
 #define SYS_TRAP 0xFF
+#define SYS_MEMSET 0x09
 #define SYS_PRINTLN 0x0A
 #define SYS_CALL_HOST 0x0B
 
@@ -16,6 +18,23 @@ static void emu_trap(U16 code) {
   register U64 a0 asm("x10") = (U64)code;
 
   asm volatile("ecall" : "+r"(a0) : "r"(a7) : "memory");
+}
+
+void emu_shutdown(void) {
+  register U64 a7 asm("x17") = SYS_SHUTDOWN;
+
+  asm volatile("ecall" : : "r"(a7) : "memory");
+}
+
+U64 emu_memset(const U8 *buf, U8 value, U64 len) {
+  register U64 a7 asm("x17") = SYS_MEMSET;
+  register U64 a0 asm("x10") = (U64)buf;
+  register U64 a1 asm("x11") = (U64)value;
+  register U64 a2 asm("x12") = len;
+
+  asm volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a7) : "memory");
+
+  return a0;
 }
 
 void emu_println(const U8 *buf, U64 len) {
@@ -68,17 +87,18 @@ U64 emu_out_pop_u64() {
 }
 
 U8 emu_in_read_line(U8 **buf, U64 *len) {
-    const U8 func_name[] = "core::readln";
+  const U8 func_name[] = "core::readln";
 
-    emu_out_call_host_fn(func_name, sizeof(func_name)-1);
+  emu_out_call_host_fn(func_name, sizeof(func_name) - 1);
 
-    U8 *popped_buf = (U8 *)emu_out_pop_u64();
-    if (buf == 0) return 1;
+  U8 *popped_buf = (U8 *)emu_out_pop_u64();
+  if (buf == 0)
+    return 1;
 
-    *len = emu_out_pop_u64();
-    *buf = popped_buf;
+  *len = emu_out_pop_u64();
+  *buf = popped_buf;
 
-    return 0;
+  return 0;
 }
 
 void *malloc(size_t size) {
@@ -95,3 +115,6 @@ void *realloc(void *ptr, size_t size) {
 }
 void free(void *ptr) { emu_trap(0xBAD7); }
 
+U8 *memset(U8 *ptr, int value, size_t num) {
+  return (U8 *)emu_memset(ptr, value, num);
+}

@@ -34,7 +34,7 @@
 #define HAVE_RISCV_MEMMOVE_UNALIGNED
 
 //#define _memcpy memcpy
-//#define _memset memset
+#define _memset memset
 //#define _memmove memmove
 
 #if __riscv_xlen == 32
@@ -66,7 +66,7 @@
 
 #ifdef HAVE_RISCV_MEMSET
 .section .text.memset, "ax", @progbits
-.globl memset
+.globl memset_asm
 .type memset, @function
     /*
     // void *_memset(void *dst, int ch, size_t sz)

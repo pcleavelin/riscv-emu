@@ -10,6 +10,8 @@ import emu "../../bindings/odin"
 
 @(export)
 plugin_start :: proc() {
+    context = emu.EMU_CONTEXT
+
     input := emu.readln()
 
     str := fmt.aprintf("You typed in: '%s'\n", input)
