@@ -15,13 +15,27 @@
 .align 4
 
 trap_entry:
-    csrrw sp, sscratch, sp          /* sp = kernel stack, sscratch = user sp */
-    addi  sp, sp, -TRAPFRAME_SIZE
+    /* sscratch holds the kernel stack while user code runs, and zero while the
+     * kernel runs. So after the swap a zero sp means this trap came from the
+     * kernel, which is already on the right stack and must swap back. */
+    csrrw sp, sscratch, sp
+    bnez  sp, .Lfrom_user
 
+    csrrw sp, sscratch, sp          /* kernel trap: restore sp, sscratch back to 0 */
+    addi  sp, sp, -TRAPFRAME_SIZE
+    sd    x5,   5*8(sp)
+    addi  x5, sp, TRAPFRAME_SIZE    /* the sp we interrupted */
+    sd    x5,   2*8(sp)
+    j     .Lsaved_sp
+
+.Lfrom_user:
+    addi  sp, sp, -TRAPFRAME_SIZE
     sd    x5,   5*8(sp)             /* free up t0 before we need a scratch */
     csrr  x5, sscratch              /* recover the user sp ... */
     sd    x5,   2*8(sp)             /* ... and record it in the frame */
+    csrw  sscratch, zero            /* we are in the kernel now */
 
+.Lsaved_sp:
     sd    x1,   1*8(sp)
     sd    x3,   3*8(sp)
     sd    x4,   4*8(sp)
@@ -55,10 +69,18 @@ trap_entry:
     mv    a0, sp                    /* hand the frame to the handler */
     call  trap_handler
 
-    /* Stage the user sp in sscratch, then restore everything else. */
-    ld    t0,   2*8(sp)
+    /* Leave sscratch holding what the mode we return to expects: the kernel
+     * stack if user code is about to run, zero if we stay in the kernel. */
+    csrr  t0, sstatus
+    andi  t0, t0, (1 << 8)          /* SPP */
+    bnez  t0, .Lto_kernel
+    addi  t0, sp, TRAPFRAME_SIZE
     csrw  sscratch, t0
+    j     .Lrestore
+.Lto_kernel:
+    csrw  sscratch, zero
 
+.Lrestore:
     ld    x1,   1*8(sp)
     ld    x3,   3*8(sp)
     ld    x4,   4*8(sp)
@@ -90,8 +112,7 @@ trap_entry:
     ld    x30, 30*8(sp)
     ld    x31, 31*8(sp)
 
-    addi  sp, sp, TRAPFRAME_SIZE    /* sp back to the kernel stack top */
-    csrrw sp, sscratch, sp          /* sp = user sp, sscratch = kernel stack */
+    ld    x2,   2*8(sp)             /* sp last: it is also the frame's base */
     sret
     .size trap_entry, . - trap_entry
 
@@ -205,4 +226,15 @@ csr_read_stval:
 .globl csr_write_stvec
 csr_write_stvec:
     csrw stvec, a0
+    ret
+
+.globl csr_write_satp
+csr_write_satp:
+    csrw satp, a0
+    sfence.vma
+    ret
+
+.globl csr_read_satp
+csr_read_satp:
+    csrr a0, satp
     ret

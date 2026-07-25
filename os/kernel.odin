@@ -20,6 +20,9 @@ EMU_TEMP_ALLOCATOR: mem.Allocator
 
 EMU_CONTEXT: runtime.Context
 
+// The kernel address space. Identity mapped, supervisor-only.
+kernel_root: ^PageTable
+
 @(export)
 _start :: proc() {
     data := slice.bytes_from_ptr(rawptr(uintptr(0x4000)), 1024 * 1024 * 512)
@@ -40,14 +43,17 @@ _start :: proc() {
 
     trap_init() // route traps to the kernel before anything can cause one
 
+    kernel_root = paging_init()
+    kprint("kernel: paging on, satp=%x\n", csr_read_satp())
+
     k: Kernel
     boot(&k) // register the initial processes
     schedule(&k)
 
-    // Phase 3a milestone: the same machine, now running code that has no access
-    // to any of the above except through a syscall.
-    kprint("kernel: dropping to user mode\n")
-    run_user(rawptr(hello_user), make([]u8, 16 * 1024))
+    // The identity map is supervisor-only, so user code has nothing it may
+    // execute yet. Restoring this needs a per-process page table.
+    // kprint("kernel: dropping to user mode\n")
+    // run_user(rawptr(hello_user), make([]u8, 16 * 1024))
 
     for p in k.processes {
         if p.mailbox.dropped > 0 {
@@ -55,6 +61,32 @@ _start :: proc() {
         }
     }
     kprint("kernel: idle, shutting down\n")
+
+    address_space_demo()
+}
+
+// Show that a mapping belongs to an address space rather than to the machine:
+// the same virtual address is memory in one space and a fault in another.
+PRIVATE_VA :: u64(0x1_0000_0000) // above the kernel's identity map
+
+address_space_demo :: proc() {
+    space := create_address_space()
+
+    frame, err := mem.alloc(PAGE_SIZE, PAGE_SIZE, EMU_ALLOCATOR)
+    assert(err == nil, "out of memory")
+    map_page(space, PRIVATE_VA, u64(uintptr(frame)), PTE_R | PTE_W)
+
+    satp_write_root(space)
+    private := (^u64)(uintptr(PRIVATE_VA))
+    private^ = 0xC0FFEE
+    kprint("kernel: in the new space, 0x%x reads %x\n", PRIVATE_VA, private^)
+
+    satp_write_root(kernel_root)
+    kprint("kernel: back in the kernel space, that address is gone\n")
+
+    // Reading it here raises a load page fault with stval = PRIVATE_VA, which is
+    // fatal in the kernel: there is no process to kill instead.
+    //   kprint("%x\n", private^)
 }
 
 // --- Process model -------------------------------------------------------------

@@ -57,6 +57,41 @@ SSTATUS_SPP  :: u64(1) << 8 // privilege level the trap came from (1 = S, 0 = U)
 // scause values for the traps the emulator raises.
 CAUSE_ECALL_FROM_U   :: u64(8)
 CAUSE_ILLEGAL_INSTR  :: u64(2)
+CAUSE_FETCH_PAGE_FAULT :: u64(12)
+CAUSE_LOAD_PAGE_FAULT  :: u64(13)
+CAUSE_STORE_PAGE_FAULT :: u64(15)
+
+// --- Sv39 paging ---------------------------------------------------------------
+//
+// A 39-bit virtual address splits into three 9-bit page-table indices and a
+// 12-bit offset, so a walk is three levels deep over 4KB pages. A leaf found
+// above the last level is a superpage covering 2MB or 1GB, which is what makes an
+// identity map cheap to build.
+
+PAGE_SIZE :: u64(4096)
+PAGE_SHIFT :: uint(12)
+PTE_SIZE :: u64(8)
+PTE_PER_PAGE :: u64(512)
+
+SATP_MODE_BARE :: u64(0)
+SATP_MODE_SV39 :: u64(8)
+
+// Page table entry flags.
+PTE_V :: u64(1) << 0 // valid
+PTE_R :: u64(1) << 1 // readable
+PTE_W :: u64(1) << 2 // writable
+PTE_X :: u64(1) << 3 // executable
+PTE_U :: u64(1) << 4 // reachable from user mode
+PTE_A :: u64(1) << 6 // accessed
+PTE_D :: u64(1) << 7 // dirty
+
+// What a memory access is for. Each requires a different permission bit, and
+// faults with a different cause.
+MemAccess :: enum {
+    Fetch,
+    Load,
+    Store,
+}
 
 Emu64 :: struct {
     reg: [31]u64,
@@ -82,6 +117,15 @@ Emu64 :: struct {
 
     // Supervisor control registers, indexed by CSR address.
     csr: map[u16]u64,
+
+    // A page fault raised part-way through an instruction. Translation happens
+    // deep inside the memory accessors, which cannot report failure, so a fault
+    // is recorded here and emu_step delivers it once the instruction finishes.
+    // Delivery is therefore precise for a fetch fault but only approximate for a
+    // load or store, which may already have written a register.
+    fault_pending: bool,
+    fault_cause:   u64,
+    fault_addr:    u64,
 }
 
 HostFn :: proc(emu: ^Emu64, user_data: rawptr) -> (ok: bool)
@@ -186,6 +230,7 @@ InstrMnemonic :: enum u8 {
     SRET,
     MRET,
     WFI,
+    SFENCE_VMA,
     CSRRW, CSRRS, CSRRC,
     CSRRWI, CSRRSI, CSRRCI,
     NOP,
@@ -246,7 +291,7 @@ Instr :: struct {
 
 emu_make :: proc(max_memory: int) -> Emu64 {
     e := Emu64 {
-        page_table = emu_make_page_table(1024 * 16),
+        page_table = emu_make_page_table(PAGE_SIZE),
         host_functions = make(map[string]HostFunction),
         csr = make(map[u16]u64),
         mode = .Supervisor,
@@ -344,50 +389,57 @@ emu_copy_into_mem :: proc(e: ^Emu64, src: []u8, dst_addr: u64) {
     }
 }
 
-emu_read_u64 :: proc(e: ^Emu64, vaddr: u64, loc := #caller_location) -> u64 {
-    page := emu_get_page(e, vaddr)
+// --- Physical memory -----------------------------------------------------------
+//
+// Sparse RAM addressed by physical address. A frame springs into existence the
+// first time it is touched, which models a machine whose memory is simply there.
+// Nothing here consults the page tables -- that is the translation layer's job,
+// and a page-table walk itself reads through these.
+
+phys_read_u64 :: proc(e: ^Emu64, paddr: u64, loc := #caller_location) -> u64 {
+    page := emu_get_page(e, paddr)
     assert(page != nil, "no page found")
 
-    offset := vaddr - page.start_addr
+    offset := paddr - page.start_addr
     assert(offset+7 < u64(len(page.virtual_mem)), "u64 crosses page boundary", loc)
 
     return u64((transmute(^u64)(&page.virtual_mem[offset]))^)
 }
 
-emu_read_u32 :: proc(e: ^Emu64, vaddr: u64, loc := #caller_location) -> u32 {
-    page := emu_get_page(e, vaddr)
+phys_read_u32 :: proc(e: ^Emu64, paddr: u64, loc := #caller_location) -> u32 {
+    page := emu_get_page(e, paddr)
     assert(page != nil, "no page found")
 
-    offset := vaddr - page.start_addr
+    offset := paddr - page.start_addr
     assert(offset+3 < u64(len(page.virtual_mem)), "u32 crosses page boundary", loc)
 
     return u32((transmute(^u32)(&page.virtual_mem[offset]))^)
 }
 
-emu_read_u16 :: proc(e: ^Emu64, vaddr: u64, loc := #caller_location) -> u16 {
-    page := emu_get_page(e, vaddr)
+phys_read_u16 :: proc(e: ^Emu64, paddr: u64, loc := #caller_location) -> u16 {
+    page := emu_get_page(e, paddr)
     assert(page != nil, "no page found")
 
-    offset := vaddr - page.start_addr
+    offset := paddr - page.start_addr
     assert(offset+1 < u64(len(page.virtual_mem)), "u16 crosses page boundary", loc)
 
     return u16((transmute(^u16)(&page.virtual_mem[offset]))^)
 }
 
-emu_read_u8 :: proc(e: ^Emu64, vaddr: u64, loc := #caller_location) -> u8 {
-    page := emu_get_page(e, vaddr)
+phys_read_u8 :: proc(e: ^Emu64, paddr: u64, loc := #caller_location) -> u8 {
+    page := emu_get_page(e, paddr)
     assert(page != nil, "no page found")
 
-    offset := vaddr - page.start_addr
+    offset := paddr - page.start_addr
 
     return u8((transmute(^u8)(&page.virtual_mem[offset]))^)
 }
 
-emu_write_u64 :: proc(e: ^Emu64, vaddr: u64, value: u64) {
-    page := emu_get_page(e, vaddr)
+phys_write_u64 :: proc(e: ^Emu64, paddr: u64, value: u64) {
+    page := emu_get_page(e, paddr)
     assert(page != nil, "no page found")
 
-    offset := vaddr - page.start_addr
+    offset := paddr - page.start_addr
     assert(offset+7 < u64(len(page.virtual_mem)), "u64 crosses page boundary")
 
     for i in 0..<8 {
@@ -395,11 +447,11 @@ emu_write_u64 :: proc(e: ^Emu64, vaddr: u64, value: u64) {
     }
 }
 
-emu_write_u32 :: proc(e: ^Emu64, vaddr: u64, value: u32) {
-    page := emu_get_page(e, vaddr)
+phys_write_u32 :: proc(e: ^Emu64, paddr: u64, value: u32) {
+    page := emu_get_page(e, paddr)
     assert(page != nil, "no page found")
 
-    offset := vaddr - page.start_addr
+    offset := paddr - page.start_addr
     assert(offset+3 < u64(len(page.virtual_mem)), "u32 crosses page boundary")
 
     for i in 0..<4 {
@@ -407,11 +459,11 @@ emu_write_u32 :: proc(e: ^Emu64, vaddr: u64, value: u32) {
     }
 }
 
-emu_write_u16 :: proc(e: ^Emu64, vaddr: u64, value: u16) {
-    page := emu_get_page(e, vaddr)
+phys_write_u16 :: proc(e: ^Emu64, paddr: u64, value: u16) {
+    page := emu_get_page(e, paddr)
     assert(page != nil, "no page found")
 
-    offset := vaddr - page.start_addr
+    offset := paddr - page.start_addr
     assert(offset+1 < u64(len(page.virtual_mem)), "u16 crosses page boundary")
 
     for i in 0..<2 {
@@ -419,16 +471,127 @@ emu_write_u16 :: proc(e: ^Emu64, vaddr: u64, value: u16) {
     }
 }
 
-emu_write_u8 :: proc(e: ^Emu64, vaddr: u64, value: u8) {
-    page := emu_get_page(e, vaddr)
+phys_write_u8 :: proc(e: ^Emu64, paddr: u64, value: u8) {
+    page := emu_get_page(e, paddr)
     assert(page != nil, "no page found")
 
-    offset := vaddr - page.start_addr
+    offset := paddr - page.start_addr
     page.virtual_mem[offset] = value
 }
 
-emu_get_page :: proc(e: ^Emu64, vaddr: u64) -> ^EmuMemoryPage {
-    page_index := vaddr/e.page_table.page_size
+// --- Address translation -------------------------------------------------------
+
+// Turn a virtual address into a physical one under the current satp. With paging
+// off, or in machine mode, the address passes through untouched -- which is what
+// lets the host load ELF images before the kernel has built any page tables.
+//
+// A failed walk records a fault and returns 0; the access still completes against
+// physical page 0 and emu_step delivers the trap immediately afterwards.
+emu_translate :: proc(e: ^Emu64, vaddr: u64, access: MemAccess) -> u64 {
+    satp := emu_read_csr(e, CSR_SATP)
+    if (satp >> 60) != SATP_MODE_SV39 do return vaddr
+    if e.mode == .Machine do return vaddr
+
+    vpn := [3]u64{
+        (vaddr >> 12) & 0x1FF,
+        (vaddr >> 21) & 0x1FF,
+        (vaddr >> 30) & 0x1FF,
+    }
+
+    fault :: proc(e: ^Emu64, vaddr: u64, access: MemAccess) -> u64 {
+        e.fault_pending = true
+        e.fault_addr = vaddr
+        switch access {
+            case .Fetch: e.fault_cause = CAUSE_FETCH_PAGE_FAULT
+            case .Load:  e.fault_cause = CAUSE_LOAD_PAGE_FAULT
+            case .Store: e.fault_cause = CAUSE_STORE_PAGE_FAULT
+        }
+        return 0
+    }
+
+    table := (satp & 0xFFF_FFFF_FFFF) << PAGE_SHIFT
+
+    for level := 2; level >= 0; level -= 1 {
+        pte := phys_read_u64(e, table + vpn[level]*PTE_SIZE)
+
+        if (pte & PTE_V) == 0 do return fault(e, vaddr, access)
+        // Writable-but-not-readable is a reserved encoding.
+        if (pte & PTE_W) != 0 && (pte & PTE_R) == 0 do return fault(e, vaddr, access)
+
+        if (pte & (PTE_R | PTE_X)) == 0 {
+            // A pointer to the next level down.
+            table = ((pte >> 10) & 0xFFF_FFFF_FFFF) << PAGE_SHIFT
+            continue
+        }
+
+        // Leaf. Check that this access is one the mapping actually permits.
+        switch access {
+            case .Fetch: if (pte & PTE_X) == 0 do return fault(e, vaddr, access)
+            case .Load:  if (pte & PTE_R) == 0 do return fault(e, vaddr, access)
+            case .Store: if (pte & PTE_W) == 0 do return fault(e, vaddr, access)
+        }
+
+        // U pages belong to user mode, and the supervisor may not stray into them
+        // (no SUM here). Anything else is off limits to user mode.
+        if e.mode == .User && (pte & PTE_U) == 0 do return fault(e, vaddr, access)
+        if e.mode == .Supervisor && (pte & PTE_U) != 0 do return fault(e, vaddr, access)
+
+        // For a superpage the levels below the leaf come from the virtual address.
+        ppn := (pte >> 10) & 0xFFF_FFFF_FFFF
+        for j in 0..<level {
+            shift := uint(9 * j)
+            ppn = (ppn &~ (u64(0x1FF) << shift)) | (vpn[j] << shift)
+        }
+
+        return (ppn << PAGE_SHIFT) | (vaddr & (PAGE_SIZE - 1))
+    }
+
+    return fault(e, vaddr, access)
+}
+
+// --- Virtual memory ------------------------------------------------------------
+// What the executing guest sees. Every access translates first.
+
+emu_read_u64 :: proc(e: ^Emu64, vaddr: u64, loc := #caller_location) -> u64 {
+    return phys_read_u64(e, emu_translate(e, vaddr, .Load), loc)
+}
+
+emu_read_u32 :: proc(e: ^Emu64, vaddr: u64, loc := #caller_location) -> u32 {
+    return phys_read_u32(e, emu_translate(e, vaddr, .Load), loc)
+}
+
+emu_read_u16 :: proc(e: ^Emu64, vaddr: u64, loc := #caller_location) -> u16 {
+    return phys_read_u16(e, emu_translate(e, vaddr, .Load), loc)
+}
+
+emu_read_u8 :: proc(e: ^Emu64, vaddr: u64, loc := #caller_location) -> u8 {
+    return phys_read_u8(e, emu_translate(e, vaddr, .Load), loc)
+}
+
+emu_write_u64 :: proc(e: ^Emu64, vaddr: u64, value: u64) {
+    phys_write_u64(e, emu_translate(e, vaddr, .Store), value)
+}
+
+emu_write_u32 :: proc(e: ^Emu64, vaddr: u64, value: u32) {
+    phys_write_u32(e, emu_translate(e, vaddr, .Store), value)
+}
+
+emu_write_u16 :: proc(e: ^Emu64, vaddr: u64, value: u16) {
+    phys_write_u16(e, emu_translate(e, vaddr, .Store), value)
+}
+
+emu_write_u8 :: proc(e: ^Emu64, vaddr: u64, value: u8) {
+    phys_write_u8(e, emu_translate(e, vaddr, .Store), value)
+}
+
+// Instruction fetch: same translation, but it must be against an executable page.
+emu_fetch_u16 :: proc(e: ^Emu64, vaddr: u64) -> u16 {
+    return phys_read_u16(e, emu_translate(e, vaddr, .Fetch))
+}
+
+// The sparse physical page store. Takes a PHYSICAL address.
+emu_get_page :: proc(e: ^Emu64, paddr: u64) -> ^EmuMemoryPage {
+    page_index := paddr/e.page_table.page_size
     page, ok := &e.page_table.pages[page_index]
     // assert(ok, "page hasn't been created yet")
     if !ok {
@@ -543,7 +706,7 @@ emu_add_host_function :: proc(e: ^Emu64, func_name: string, user_data: rawptr, f
 emu_decode_instr :: proc(e: ^Emu64, addr: u64 = 0) -> Instr {
     addr := e.pc if addr == 0 else addr
 
-    instruction_lo := emu_read_u16(e, addr)
+    instruction_lo := emu_fetch_u16(e, addr)
     prefix := instruction_lo & 0b11
 
     result := Instr{
@@ -629,6 +792,8 @@ emu_disasm :: proc(e: ^Emu64, addr: u64, allocator := context.temp_allocator) ->
             fmt.sbprintf(&b, "mret")
         case .WFI:
             fmt.sbprintf(&b, "wfi")
+        case .SFENCE_VMA:
+            fmt.sbprintf(&b, "sfence.vma")
 
         case .CSRRW, .CSRRS, .CSRRC:
             fmt.sbprintf(&b, "%s %s, 0x%x, %s", mnem, abi_name(op.rd), u64(op.imm), abi_name(op.rs1))
@@ -736,7 +901,7 @@ decode_rv64 :: proc(e: ^Emu64, addr: u64, result: ^Instr) {
     OP_STORE_FP                 :: 0b0100111
     OP_FP                       :: 0b1010011
 
-    raw := u32(emu_read_u16(e, addr)) | (u32(emu_read_u16(e, addr+2)) << 16)
+    raw := u32(emu_fetch_u16(e, addr)) | (u32(emu_fetch_u16(e, addr+2)) << 16)
     instr := EmuInstruction32{ raw_instruction = raw }
 
     result.raw = raw
@@ -818,6 +983,12 @@ decode_rv64_system :: proc(e: ^Emu64, instr: EmuInstruction32, result: ^Instr) {
 
     switch funct3 {
         case 0b000: {
+            // SFENCE.VMA carries operands in rs1/rs2, so it is identified by
+            // funct7 rather than by the whole immediate.
+            if instr.r_type.funct_7 == 0b0001001 {
+                result.mnemonic = .SFENCE_VMA
+                break
+            }
             switch csr {
                 case 0x000: result.mnemonic = .ECALL
                 case 0x001: result.mnemonic = .EBREAK
@@ -2050,6 +2221,11 @@ emu_eval_instr :: proc(e: ^Emu64, di: Instr) -> (pc_offset: u64, cont: bool) {
             // Nothing generates interrupts yet, so waiting would hang forever.
             return u64(di.length), true
         }
+        case .SFENCE_VMA: {
+            // Translation is walked fresh on every access, so there is no TLB to
+            // invalidate and the fence has nothing to do.
+            return u64(di.length), true
+        }
         case .CSRRW, .CSRRS, .CSRRC, .CSRRWI, .CSRRSI, .CSRRCI: {
             return eval_csr(e, di)
         }
@@ -2478,12 +2654,35 @@ emu_step :: proc(e: ^Emu64) -> StopReason {
     if e.pc == EMU_HALT_VECTOR do return .Halt
 
     e.stop_reason = .Invalid
+    e.fault_pending = false
+
     instr := emu_decode_instr(e)
+
+    // A fault on the fetch itself means nothing executed, so the trap is precise.
+    if e.fault_pending {
+        emu_deliver_fault(e, instr.addr)
+        return .None
+    }
+
     offset, cont := emu_eval_instr(e, instr)
+
+    // A fault during a load or store: the instruction may already have written a
+    // register, but the trap still lands with sepc on the faulting instruction.
+    if e.fault_pending {
+        emu_deliver_fault(e, instr.addr)
+        return .None
+    }
+
     e.pc += offset
 
     if cont do return .None
     return e.stop_reason
+}
+
+@(private)
+emu_deliver_fault :: proc(e: ^Emu64, epc: u64) {
+    e.fault_pending = false
+    emu_trap_to_supervisor(e, e.fault_cause, e.fault_addr, epc)
 }
 
 // Run the machine until it stops advancing: a clean halt, a trap, or a fault.
