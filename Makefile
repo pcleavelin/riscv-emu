@@ -4,8 +4,8 @@ emu_os:
 	mkdir -p os/bin
 	-rm os/bin/*.o
 	-rm os/bin/*.elf
-	odin build os/bootloader.odin -file -define:EMU_DEFAULT_START=false -target:freestanding_riscv64 -build-mode:object -default-to-nil-allocator -no-thread-local -no-rpath -no-crt -o:none -out:os/bin/bootloader.o
-	riscv64-none-elf-ld -T os/bootloader.ld os/bin/bootloader-* --just-symbols bin/stdlib.elf -o os/bin/bootloader.elf
+	odin build os -define:EMU_DEFAULT_START=false -target:freestanding_riscv64 -build-mode:object -default-to-nil-allocator -no-thread-local -no-rpath -no-crt -o:none -out:os/bin/kernel.o
+	riscv64-none-elf-ld -T os/kernel.ld os/bin/kernel-* --just-symbols bin/stdlib.elf -o os/bin/kernel.elf
 
 examples: emu-hello-example emu-host-to-guest-example
 

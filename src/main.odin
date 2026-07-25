@@ -24,7 +24,7 @@ run_bootloader :: proc(e: ^emu.Emu64, boot_path: string) -> (ok: bool) {
 main :: proc() {
     e := emu.emu_make(MAX_PHYS_MEM)
 
-    if !run_bootloader(&e, "os/bin/bootloader.elf") {
+    if !run_bootloader(&e, "os/bin/kernel.elf") {
         fmt.eprintln("failed to load bootloader image")
     }
 }
