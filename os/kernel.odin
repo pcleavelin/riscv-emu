@@ -38,9 +38,16 @@ _start :: proc() {
     // install the guest arena before any new/append.
     context = EMU_CONTEXT
 
+    trap_init() // route traps to the kernel before anything can cause one
+
     k: Kernel
     boot(&k) // register the initial processes
     schedule(&k)
+
+    // Phase 3a milestone: the same machine, now running code that has no access
+    // to any of the above except through a syscall.
+    kprint("kernel: dropping to user mode\n")
+    run_user(rawptr(hello_user), make([]u8, 16 * 1024))
 
     for p in k.processes {
         if p.mailbox.dropped > 0 {

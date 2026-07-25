@@ -22,6 +22,7 @@ when !EMU_NATIVE {
     @(default_calling_convention = "c")
     foreign emu_stdlib {
         emu_syscall :: proc() ---
+        emu_shutdown :: proc() ---
         emu_out_call_host_fn :: proc(buf: ^u8, len: int) ---
 
         emu_out_push_u32 :: proc(val: u32) ---
@@ -52,6 +53,7 @@ when !EMU_NATIVE {
 
     emu_in_read_line :: proc(buf: ^^u8, len: ^u64) -> u8 { return 1 }
     emu_syscall :: proc() {}
+    emu_shutdown :: proc() {}
 }
 
 MainProc :: proc()

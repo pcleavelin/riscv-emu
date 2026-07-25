@@ -28,6 +28,36 @@ StopReason :: enum {
     Invalid, // undecodable instruction
 }
 
+// Privilege levels, encoded as RISC-V numbers them. The layers map onto the
+// hardware model directly: the host is the machine/firmware layer that services
+// an S-mode ecall (the SBI role), the guest kernel runs in S, and processes run
+// in U and trap into the kernel.
+PrivilegeMode :: enum u8 {
+    User       = 0,
+    Supervisor = 1,
+    Machine    = 3,
+}
+
+// Supervisor CSRs, at their architectural addresses.
+CSR_SSTATUS  :: 0x100
+CSR_SIE      :: 0x104
+CSR_STVEC    :: 0x105
+CSR_SSCRATCH :: 0x140
+CSR_SEPC     :: 0x141
+CSR_SCAUSE   :: 0x142
+CSR_STVAL    :: 0x143
+CSR_SIP      :: 0x144
+CSR_SATP     :: 0x180
+
+// sstatus bits used by trap entry and exit.
+SSTATUS_SIE  :: u64(1) << 1 // supervisor interrupts enabled
+SSTATUS_SPIE :: u64(1) << 5 // interrupt-enable state saved on trap entry
+SSTATUS_SPP  :: u64(1) << 8 // privilege level the trap came from (1 = S, 0 = U)
+
+// scause values for the traps the emulator raises.
+CAUSE_ECALL_FROM_U   :: u64(8)
+CAUSE_ILLEGAL_INSTR  :: u64(2)
+
 Emu64 :: struct {
     reg: [31]u64,
     // Floating-point register file (F/D extension). f0..f31, each holding raw
@@ -45,6 +75,13 @@ Emu64 :: struct {
     // Set to .Invalid at the start of each emu_step; the ecall handlers overwrite
     // it with .Halt or .Trap. emu_step reports it when the evaluator halts.
     stop_reason: StopReason,
+
+    // Current privilege level. The machine boots in Supervisor: the guest kernel
+    // is the first thing to run, and its ecalls go out to the host as SBI calls.
+    mode: PrivilegeMode,
+
+    // Supervisor control registers, indexed by CSR address.
+    csr: map[u16]u64,
 }
 
 HostFn :: proc(emu: ^Emu64, user_data: rawptr) -> (ok: bool)
@@ -145,6 +182,12 @@ InstrMnemonic :: enum u8 {
     ADDIW, SLLIW, SRLIW, SRAIW,
     ADDW, SUBW, MULW, SLLW, SRLW, SRAW,
     ECALL,
+    EBREAK,
+    SRET,
+    MRET,
+    WFI,
+    CSRRW, CSRRS, CSRRC,
+    CSRRWI, CSRRSI, CSRRCI,
     NOP,
 
     // RVC (compressed)
@@ -205,6 +248,8 @@ emu_make :: proc(max_memory: int) -> Emu64 {
     e := Emu64 {
         page_table = emu_make_page_table(1024 * 16),
         host_functions = make(map[string]HostFunction),
+        csr = make(map[u16]u64),
+        mode = .Supervisor,
     }
 
     backing := make([]u8, max_memory)
@@ -216,6 +261,7 @@ emu_make :: proc(max_memory: int) -> Emu64 {
 emu_reset :: proc(e: ^Emu64, max_memory: int) {
     delete(e.page_table.pages)
     delete(e.host_functions)
+    delete(e.csr)
     delete(e.page_arena.data)
 
     e^ = emu_make(max_memory)
@@ -413,6 +459,9 @@ emu_boot :: proc(e: ^Emu64, entry: u64, stack_top: u64 = EMU_STACK_TOP) {
     e.pc = entry
     emu_write_reg(e, REG_RA, EMU_HALT_VECTOR)
     emu_write_reg(e, REG_X2, stack_top)
+
+    // The boot image is the kernel, so it starts in supervisor mode.
+    e.mode = .Supervisor
 }
 
 emu_comm_stack_clear :: proc(e: ^Emu64) {
@@ -572,6 +621,19 @@ emu_disasm :: proc(e: ^Emu64, addr: u64, allocator := context.temp_allocator) ->
             fmt.sbprintf(&b, "nop")
         case .ECALL:
             fmt.sbprintf(&b, "ecall")
+        case .EBREAK:
+            fmt.sbprintf(&b, "ebreak")
+        case .SRET:
+            fmt.sbprintf(&b, "sret")
+        case .MRET:
+            fmt.sbprintf(&b, "mret")
+        case .WFI:
+            fmt.sbprintf(&b, "wfi")
+
+        case .CSRRW, .CSRRS, .CSRRC:
+            fmt.sbprintf(&b, "%s %s, 0x%x, %s", mnem, abi_name(op.rd), u64(op.imm), abi_name(op.rs1))
+        case .CSRRWI, .CSRRSI, .CSRRCI:
+            fmt.sbprintf(&b, "%s %s, 0x%x, %d", mnem, abi_name(op.rd), u64(op.imm), op.rs1)
 
         case .ADD, .SUB, .SLL, .SLT, .SLTU, .XOR, .SRL, .SRA, .OR, .AND,
              .MUL, .MULH, .MULHSU, .MULHU, .DIV, .DIVU, .REM, .REMU,
@@ -669,7 +731,7 @@ decode_rv64 :: proc(e: ^Emu64, addr: u64, result: ^Instr) {
     OP_STORE_GROUP             :: 0b0100011
     OP_LOAD_GROUP              :: 0b0000011
     OP_SIGNED_ARITHMETIC_GROUP :: 0b0010011
-    OP_ECALL                   :: 0b1110011
+    OP_SYSTEM                  :: 0b1110011
     OP_LOAD_FP                  :: 0b0000111
     OP_STORE_FP                 :: 0b0100111
     OP_FP                       :: 0b1010011
@@ -726,8 +788,8 @@ decode_rv64 :: proc(e: ^Emu64, addr: u64, result: ^Instr) {
         case OP_STORE_GROUP: {
             decode_rv64_store(e, instr, result)
         }
-        case OP_ECALL: {
-            result.mnemonic = .ECALL
+        case OP_SYSTEM: {
+            decode_rv64_system(e, instr, result)
         }
         case OP_LOAD_FP: {
             decode_rv64_load_fp(e, instr, result)
@@ -738,6 +800,38 @@ decode_rv64 :: proc(e: ^Emu64, addr: u64, result: ^Instr) {
         case OP_FP: {
             decode_rv64_op_fp(e, instr, result)
         }
+    }
+}
+
+// The SYSTEM opcode covers both the privileged instructions and the CSR ops, told
+// apart by funct3: 0 selects a privileged instruction identified by the immediate,
+// anything else is a CSR access with the CSR address in the immediate. Decoding
+// the whole opcode as ECALL would quietly turn every csr access into a syscall.
+decode_rv64_system :: proc(e: ^Emu64, instr: EmuInstruction32, result: ^Instr) {
+    funct3 := instr.i_type.funct_3
+    csr := instr.i_type.imm
+
+    result.op.rd = instr.i_type.rd
+    result.op.rs1 = instr.i_type.rs1
+    result.op.rs1_val = emu_read_reg(e, int(instr.i_type.rs1))
+    result.op.imm = i64(csr)
+
+    switch funct3 {
+        case 0b000: {
+            switch csr {
+                case 0x000: result.mnemonic = .ECALL
+                case 0x001: result.mnemonic = .EBREAK
+                case 0x102: result.mnemonic = .SRET
+                case 0x302: result.mnemonic = .MRET
+                case 0x105: result.mnemonic = .WFI
+            }
+        }
+        case 0b001: result.mnemonic = .CSRRW
+        case 0b010: result.mnemonic = .CSRRS
+        case 0b011: result.mnemonic = .CSRRC
+        case 0b101: result.mnemonic = .CSRRWI
+        case 0b110: result.mnemonic = .CSRRSI
+        case 0b111: result.mnemonic = .CSRRCI
     }
 }
 
@@ -1932,9 +2026,32 @@ emu_eval_instr :: proc(e: ^Emu64, di: Instr) -> (pc_offset: u64, cont: bool) {
             return u64(di.length), true
         }
 
-        // --- ECALL ---
+        // --- Privileged / CSR ---
         case .ECALL: {
+            // An ecall from user mode is a syscall into the guest kernel. Only an
+            // ecall the kernel itself makes leaves the machine for the host, which
+            // is the SBI role.
+            if e.mode == .User {
+                emu_trap_to_supervisor(e, CAUSE_ECALL_FROM_U, 0, di.addr)
+                return 0, true
+            }
             return eval_ecall(e, di)
+        }
+        case .EBREAK: {
+            e.stop_reason = .Trap
+            fmt.eprintf("\n\nEBREAK at 0x%x\n\n", di.addr)
+            return 0, false
+        }
+        case .SRET: {
+            emu_sret(e)
+            return 0, true
+        }
+        case .WFI: {
+            // Nothing generates interrupts yet, so waiting would hang forever.
+            return u64(di.length), true
+        }
+        case .CSRRW, .CSRRS, .CSRRC, .CSRRWI, .CSRRSI, .CSRRCI: {
+            return eval_csr(e, di)
         }
 
         // --- Floating-point loads / stores ---
@@ -2113,6 +2230,83 @@ emu_eval_instr :: proc(e: ^Emu64, di: Instr) -> (pc_offset: u64, cont: bool) {
     }
 
     return 0, false
+}
+
+// --- Privileged state ----------------------------------------------------------
+
+emu_read_csr :: proc(e: ^Emu64, addr: u16) -> u64 {
+    return e.csr[addr] if addr in e.csr else 0
+}
+
+emu_write_csr :: proc(e: ^Emu64, addr: u16, value: u64) {
+    e.csr[addr] = value
+}
+
+// Enter the supervisor trap handler: record where the trap came from and why,
+// stash the interrupt-enable state, then jump to stvec. `epc` is the address of
+// the faulting instruction, so the handler decides whether to retry it or step
+// past it -- for an ecall the kernel resumes at epc+4.
+emu_trap_to_supervisor :: proc(e: ^Emu64, cause: u64, tval: u64, epc: u64) {
+    status := emu_read_csr(e, CSR_SSTATUS)
+
+    // SPIE remembers whether interrupts were on; SPP remembers the old mode.
+    status = (status &~ SSTATUS_SPIE) | (SSTATUS_SPIE if (status & SSTATUS_SIE) != 0 else 0)
+    status &~= SSTATUS_SIE
+    status = (status &~ SSTATUS_SPP) | (SSTATUS_SPP if e.mode == .Supervisor else 0)
+
+    emu_write_csr(e, CSR_SSTATUS, status)
+    emu_write_csr(e, CSR_SEPC, epc)
+    emu_write_csr(e, CSR_SCAUSE, cause)
+    emu_write_csr(e, CSR_STVAL, tval)
+
+    e.mode = .Supervisor
+    e.pc = emu_read_csr(e, CSR_STVEC) &~ u64(0b11) // low bits select the trap mode
+}
+
+// Return from a supervisor trap: restore the privilege level and interrupt state
+// that SPP/SPIE recorded, then resume at sepc. This is also how the kernel enters
+// user mode for the first time -- it sets sepc and clears SPP, then executes sret.
+emu_sret :: proc(e: ^Emu64) {
+    status := emu_read_csr(e, CSR_SSTATUS)
+
+    e.mode = .Supervisor if (status & SSTATUS_SPP) != 0 else .User
+
+    status = (status &~ SSTATUS_SIE) | (SSTATUS_SIE if (status & SSTATUS_SPIE) != 0 else 0)
+    status |= SSTATUS_SPIE
+    status &~= SSTATUS_SPP
+
+    emu_write_csr(e, CSR_SSTATUS, status)
+    e.pc = emu_read_csr(e, CSR_SEPC)
+}
+
+// CSR read-modify-write. Every variant reads the old value into rd and then
+// applies its write, so a read-only use (rd = csr, rs1 = x0) leaves it untouched.
+eval_csr :: proc(e: ^Emu64, di: Instr) -> (pc_offset: u64, cont: bool) {
+    if e.mode == .User {
+        emu_trap_to_supervisor(e, CAUSE_ILLEGAL_INSTR, u64(di.raw), di.addr)
+        return 0, true
+    }
+
+    addr := u16(di.op.imm)
+    old := emu_read_csr(e, addr)
+
+    // The immediate forms take a 5-bit unsigned value from the rs1 field.
+    source := di.op.rs1_val
+    #partial switch di.mnemonic {
+        case .CSRRWI, .CSRRSI, .CSRRCI: source = u64(di.op.rs1)
+    }
+
+    new_value := old
+    #partial switch di.mnemonic {
+        case .CSRRW, .CSRRWI: new_value = source
+        case .CSRRS, .CSRRSI: if source != 0 do new_value = old | source
+        case .CSRRC, .CSRRCI: if source != 0 do new_value = old &~ source
+    }
+
+    if new_value != old do emu_write_csr(e, addr, new_value)
+    emu_write_reg(e, int(di.op.rd), old)
+
+    return u64(di.length), true
 }
 
 eval_ecall :: proc(e: ^Emu64, di: Instr) -> (pc_offset: u64, cont: bool) {
