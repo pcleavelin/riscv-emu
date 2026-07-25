@@ -4,7 +4,7 @@ import "core:fmt"
 
 import emu "./emu_core"
 
-MAX_PHYS_MEM :: 1024 * 512 // 512KB
+MAX_PHYS_MEM :: 1024 * 1024 * 16 // 16MB: backs the lazily-created guest pages
 
 // Load a bootloader image and run the machine from its ELF entry point until it
 // halts. The shared guest runtime (stdlib.elf: memset/memcpy and the syscall

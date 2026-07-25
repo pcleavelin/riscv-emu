@@ -1,11 +1,12 @@
 package kernel
 
 // The OS kernel image, entered from the emulator's boot vector. _start brings up
-// the guest allocator, then hands control to the actor scheduler. The initial
-// actors are registered by boot() (see the app files); once user apps load from
-// their own ELFs at runtime, that hook becomes a real launcher.
+// the guest allocator, then hands control to the scheduler. The initial processes
+// are registered by boot() (os/boot.odin); once user apps load from their own
+// ELFs at runtime, that hook becomes a real launcher.
 
 import "base:runtime"
+import "core:fmt"
 import "core:mem"
 import "core:slice"
 import "core:strings"
@@ -39,72 +40,212 @@ _start :: proc() {
     context = EMU_CONTEXT
 
     k: Kernel
-    boot(&k) // register the initial actors
-    run(&k)  // drain messages until the system goes idle
+    boot(&k) // register the initial processes
+    schedule(&k)
+
+    kprint("kernel: idle, shutting down\n")
 }
 
-// --- Actor runtime -------------------------------------------------------------
+// --- Process model -------------------------------------------------------------
 //
-// Phase 1: run-to-completion actors. An actor is a message handler; the scheduler
-// drains a FIFO of envelopes, dispatching each to its target's behavior. An actor
-// keeps state between messages in `state` and reaches other actors only through
-// `send` -- no shared calls, no blocking. Cooperative fibers (blocking recv) and
-// real isolation (privilege traps, then paging) come in later phases behind this
-// same spawn/send API.
+// A process is an actor: it owns private memory and reaches other processes only
+// by message. Two kinds differ in who owns the loop:
+//
+//   Service -- the kernel owns the loop and calls on_message per message. The
+//              process is stackless and runs to completion each turn, so state
+//              that outlives a message lives in `user_state`. Cheap; the default.
+//   Task    -- the process owns the loop, running on its own stack as a fiber.
+//              It can block mid-computation (recv) or step aside (yield), so its
+//              state lives in ordinary locals.
+//
+// Lifecycle: spawn -> Ready|Waiting -> (Ready <-> Waiting)* -> Dead.
+// A service spawns Waiting (nothing to do until a message arrives); a task spawns
+// Ready (it wants to run). A send into a Waiting process wakes it. A task that
+// returns from its entry proc becomes Dead and the kernel reclaims its memory.
 
-ActorId :: distinct int
+ProcessId :: distinct int
+
+NO_PROCESS :: ProcessId(-1) // sender id for kernel-originated messages
+
+ProcessKind :: enum {
+    Service,
+    Task,
+}
+
+ProcessState :: enum {
+    Ready,   // wants CPU: a service with mail, or a runnable task
+    Waiting, // blocked until a message arrives
+    Dead,    // exited; memory reclaimed
+}
+
+MessageHandler :: proc(p: ^Process, msg: Message)
+TaskEntry :: proc(p: ^Process)
 
 Message :: struct {
-    from: ActorId,
-    tag:  string, // message kind, e.g. "ping"
-    data: []u8,   // payload bytes, copied into kernel memory by send
+    from: ProcessId,
+    tag:  string, // message kind, e.g. "inc"
+    data: []u8,   // payload bytes, owned by the receiving process
 }
 
-Behavior :: proc(k: ^Kernel, self: ActorId, msg: Message)
-
-Actor :: struct {
-    behavior: Behavior,
-    state:    rawptr,
-    alive:    bool,
+// Callee-saved CPU state for a fiber. Layout must match os/switch.S.
+Context :: struct {
+    ra: u64,
+    sp: u64,
+    s:  [12]u64,
+    fs: [12]u64,
 }
 
-Envelope :: struct {
-    to:  ActorId,
-    msg: Message,
+Process :: struct {
+    id:     ProcessId,
+    kind:   ProcessKind,
+    state:  ProcessState,
+    kernel: ^Kernel,
+
+    // Service: the handler and the state it keeps between messages.
+    on_message: MessageHandler,
+    user_state: rawptr,
+
+    // Task: entry point, saved CPU state, and the stack the fiber runs on.
+    entry: TaskEntry,
+    ctx:   Context,
+    stack: []u8,
+
+    // Every process owns its mailbox and the memory behind it: send copies the
+    // payload into the *receiver's* arena, so a process holds no pointer into
+    // another's memory. That is also what real isolation will require later,
+    // where copying across address spaces is mandatory.
+    mailbox:   [dynamic]Message,
+    arena:     mem.Arena,
+    allocator: mem.Allocator,
 }
 
 Kernel :: struct {
-    actors: [dynamic]Actor,
-    queue:  [dynamic]Envelope,
+    processes: [dynamic]^Process,
+    current:   ^Process,
+
+    // The scheduler's own CPU state. A task switches here to give up the CPU.
+    sched_ctx: Context,
 }
 
-// Register a new actor and return its id. `state` is an opaque per-actor pointer
-// the behavior owns; the kernel never looks inside it.
-spawn :: proc(k: ^Kernel, behavior: Behavior, state: rawptr = nil) -> ActorId {
-    append(&k.actors, Actor{behavior = behavior, state = state, alive = true})
-    return ActorId(len(k.actors) - 1)
+// A task's stack is carved from its own arena, so the arena must be comfortably
+// larger than the stack -- what is left is the room its mailbox and state grow
+// into. Sizing them equal starves the mailbox.
+PROCESS_ARENA_SIZE :: 64 * 1024
+TASK_STACK_SIZE :: 16 * 1024
+
+foreign import kernel_asm "system:kernel_asm"
+
+@(default_calling_convention = "c")
+foreign kernel_asm {
+    ctx_switch :: proc(from: ^Context, to: ^Context) ---
+    fiber_trampoline :: proc() ---
 }
 
-// Enqueue a message for `to`, stamped with the sender. tag and data are copied
-// into kernel-owned memory so the caller can reuse its buffers immediately.
-// NOTE: that memory is not reclaimed yet -- a freeing mailbox allocator is a
-// later task (the arena only grows).
-send :: proc(k: ^Kernel, from, to: ActorId, tag: string, data: []u8 = nil) {
+// First code to run on a new fiber's stack, reached from fiber_trampoline. Runs
+// the task to completion, then parks it as Dead and leaves for good.
+@(export)
+fiber_main :: proc "c" (p: ^Process) {
+    context = EMU_CONTEXT
+
+    p.entry(p)
+
+    p.state = .Dead
+    ctx_switch(&p.ctx, &p.kernel.sched_ctx)
+}
+
+@(private)
+process_init :: proc(k: ^Kernel, kind: ProcessKind) -> ^Process {
+    p := new(Process)
+    p.id = ProcessId(len(k.processes))
+    p.kind = kind
+    p.kernel = k
+
+    backing, _ := runtime.mem_alloc_non_zeroed(PROCESS_ARENA_SIZE, allocator = EMU_ALLOCATOR)
+    mem.arena_init(&p.arena, backing)
+    p.allocator = mem.arena_allocator(&p.arena)
+    p.mailbox = make([dynamic]Message, p.allocator)
+
+    append(&k.processes, p)
+    return p
+}
+
+// Register a reactive service: the kernel calls `on_message` once per delivered
+// message. `state` is an opaque pointer the handler owns; the kernel never looks
+// inside it. Starts Waiting -- idle until someone sends to it.
+spawn_service :: proc(k: ^Kernel, on_message: MessageHandler, state: rawptr = nil) -> ProcessId {
+    p := process_init(k, .Service)
+    p.on_message = on_message
+    p.user_state = state
+    p.state = .Waiting
+    return p.id
+}
+
+// Register an active task: `entry` runs on its own stack and owns its loop.
+// Starts Ready. The context is seeded so the first switch into it "returns" into
+// fiber_trampoline with s0 holding the process pointer.
+spawn_task :: proc(k: ^Kernel, entry: TaskEntry) -> ProcessId {
+    p := process_init(k, .Task)
+    p.entry = entry
+    p.state = .Ready
+
+    p.stack = make([]u8, TASK_STACK_SIZE, p.allocator)
+
+    stack_top := uintptr(raw_data(p.stack)) + uintptr(len(p.stack))
+    p.ctx.sp = u64(stack_top &~ uintptr(15)) // the ABI wants a 16-byte aligned sp
+    p.ctx.ra = u64(uintptr(rawptr(fiber_trampoline)))
+    p.ctx.s[0] = u64(uintptr(p))
+
+    return p.id
+}
+
+// --- Messaging -----------------------------------------------------------------
+
+@(private)
+deliver :: proc(k: ^Kernel, from, to: ProcessId, tag: string, data: []u8) {
+    if int(to) < 0 || int(to) >= len(k.processes) do return
+
+    target := k.processes[int(to)]
+    if target.state == .Dead do return
+
+    // Copy into the receiver's arena so the sender can reuse its buffers and no
+    // pointer crosses a process boundary.
+    // NOTE: a process arena is not reclaimed until the process exits, so a
+    // long-lived mailbox only grows. A freeing mailbox allocator is a later task.
+    owned_tag := strings.clone(tag, target.allocator)
     owned_data: []u8
     if len(data) > 0 {
-        owned_data = make([]u8, len(data))
+        owned_data = make([]u8, len(data), target.allocator)
         copy(owned_data, data)
     }
-    append(&k.queue, Envelope{
-        to  = to,
-        msg = Message{from = from, tag = strings.clone(tag), data = owned_data},
-    })
+
+    // An exhausted process arena makes append a silent no-op, which shows up
+    // much later as a receiver that blocks forever. Fail here instead.
+    before := len(target.mailbox)
+    append(&target.mailbox, Message{from = from, tag = owned_tag, data = owned_data})
+    assert(len(target.mailbox) == before + 1, "mailbox append failed: process arena exhausted")
+
+    if target.state == .Waiting do target.state = .Ready
+}
+
+// Send from one process to another.
+send :: proc(p: ^Process, to: ProcessId, tag: string, data: []u8 = nil) {
+    deliver(p.kernel, p.id, to, tag, data)
 }
 
 // Send a plain-old-data value as the payload. Pair with message_value to read it.
-send_value :: proc(k: ^Kernel, from, to: ActorId, tag: string, value: $T) {
+send_value :: proc(p: ^Process, to: ProcessId, tag: string, value: $T) {
     v := value
-    send(k, from, to, tag, slice.bytes_from_ptr(&v, size_of(T)))
+    deliver(p.kernel, p.id, to, tag, slice.bytes_from_ptr(&v, size_of(T)))
+}
+
+// Post from the kernel itself, with no sending process (used by boot).
+post :: proc(k: ^Kernel, to: ProcessId, tag: string, data: []u8 = nil) {
+    deliver(k, NO_PROCESS, to, tag, data)
+}
+
+post_value :: proc(k: ^Kernel, to: ProcessId, tag: string, value: $T) {
+    v := value
+    deliver(k, NO_PROCESS, to, tag, slice.bytes_from_ptr(&v, size_of(T)))
 }
 
 // Reinterpret a message payload as a value of type T.
@@ -113,16 +254,100 @@ message_value :: proc(msg: Message, $T: typeid) -> T {
     return (cast(^T)raw_data(msg.data))^
 }
 
-// Drain the queue until no messages remain, dispatching each to its target's
-// behavior. Behaviors may send more messages, which extend the same queue.
-run :: proc(k: ^Kernel) {
-    for len(k.queue) > 0 {
-        env := k.queue[0]
-        ordered_remove(&k.queue, 0)
+@(private)
+mailbox_pop :: proc(p: ^Process) -> (msg: Message, ok: bool) {
+    if len(p.mailbox) == 0 do return {}, false
+    msg = p.mailbox[0]
+    ordered_remove(&p.mailbox, 0)
+    return msg, true
+}
 
-        actor := k.actors[int(env.to)]
-        if actor.alive {
-            actor.behavior(k, env.to, env.msg)
-        }
+// --- Task-only primitives ------------------------------------------------------
+// These suspend the caller, so only a fiber task may use them. A service is
+// stackless and must return instead of blocking.
+
+// Give up the CPU but stay runnable.
+yield :: proc(p: ^Process) {
+    assert(p.kind == .Task, "yield is only valid inside a task")
+    p.state = .Ready
+    ctx_switch(&p.ctx, &p.kernel.sched_ctx)
+}
+
+// Block until a message arrives, then take it.
+recv :: proc(p: ^Process) -> Message {
+    assert(p.kind == .Task, "recv is only valid inside a task")
+    for len(p.mailbox) == 0 {
+        p.state = .Waiting
+        ctx_switch(&p.ctx, &p.kernel.sched_ctx)
     }
+    msg, _ := mailbox_pop(p)
+    return msg
+}
+
+// Take a message if one is waiting; never blocks.
+try_recv :: proc(p: ^Process) -> (Message, bool) {
+    return mailbox_pop(p)
+}
+
+// Block until a message with `tag` arrives. Use this for request/reply, where
+// unrelated mail may already be queued ahead of the response.
+// NOTE: non-matching messages are discarded, not re-queued.
+recv_tag :: proc(p: ^Process, tag: string) -> Message {
+    for {
+        msg := recv(p)
+        if msg.tag == tag do return msg
+        kprint("  [%d dropped %s while waiting for %s]\n", p.id, msg.tag, tag)
+    }
+}
+
+// --- Scheduler -----------------------------------------------------------------
+
+// Round-robin over the runnable processes until the system goes idle -- that is,
+// until nothing is Ready. A service gets one message per turn; a task runs until
+// it yields, blocks, or exits.
+schedule :: proc(k: ^Kernel) {
+    for {
+        ran_something := false
+
+        for p in k.processes {
+            if p.state != .Ready do continue
+
+            ran_something = true
+            k.current = p
+
+            switch p.kind {
+            case .Service:
+                if msg, ok := mailbox_pop(p); ok {
+                    p.on_message(p, msg)
+                }
+                // Stay Ready while mail remains, so the next turn drains it.
+                if len(p.mailbox) == 0 && p.state == .Ready {
+                    p.state = .Waiting
+                }
+
+            case .Task:
+                ctx_switch(&k.sched_ctx, &p.ctx)
+                if p.state == .Dead do process_free(p)
+            }
+
+            k.current = nil
+        }
+
+        if !ran_something do return
+    }
+}
+
+// Release everything a dead process owns in one shot: mailbox, stack, and state
+// all live in its arena.
+@(private)
+process_free :: proc(p: ^Process) {
+    free_all(p.allocator)
+    p.mailbox = nil
+    p.stack = nil
+}
+
+// --- Utilities -----------------------------------------------------------------
+
+kprint :: proc(format: string, args: ..any) {
+    emu.print(fmt.tprintf(format, ..args))
 }
