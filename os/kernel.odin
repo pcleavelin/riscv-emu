@@ -9,7 +9,6 @@ import "base:runtime"
 import "core:fmt"
 import "core:mem"
 import "core:slice"
-import "core:strings"
 
 import emu "../bindings/odin"
 
@@ -43,6 +42,11 @@ _start :: proc() {
     boot(&k) // register the initial processes
     schedule(&k)
 
+    for p in k.processes {
+        if p.mailbox.dropped > 0 {
+            kprint("kernel: process %d lost %d message(s) to overflow\n", p.id, p.mailbox.dropped)
+        }
+    }
     kprint("kernel: idle, shutting down\n")
 }
 
@@ -87,6 +91,43 @@ Message :: struct {
     data: []u8,   // payload bytes, owned by the receiving process
 }
 
+// --- Mailbox -------------------------------------------------------------------
+//
+// A mailbox is a fixed ring of slots with tag and payload stored inline, so a
+// send neither allocates nor leaves anything to free and a process can never
+// grow its way out of memory. Bulk data will need a separate memory-grant
+// mechanism later; small inline messages are the microkernel norm.
+
+MAILBOX_CAPACITY :: 16
+MESSAGE_TAG_MAX :: 16
+MESSAGE_DATA_MAX :: 64
+
+Slot :: struct {
+    from:     ProcessId,
+    tag_len:  int,
+    data_len: int,
+    tag_buf:  [MESSAGE_TAG_MAX]u8,
+    data_buf: [MESSAGE_DATA_MAX]u8,
+}
+
+Mailbox :: struct {
+    slots:   [MAILBOX_CAPACITY]Slot,
+    head:    int, // index of the oldest queued message
+    count:   int,
+    dropped: int, // lost to overflow; counted so loss is never silent
+}
+
+// What a full mailbox does with an arriving message.
+Backpressure :: enum {
+    // Refuse the send and tell the sender, which can then retry or back off.
+    // Never destroys a message the system already accepted, so command order
+    // and request/reply stay intact. The safe default.
+    RejectNewest,
+    // Evict the oldest to make room for the newest. For state and telemetry --
+    // the latest mouse position matters, a stale backlog of them does not.
+    DropOldest,
+}
+
 // Callee-saved CPU state for a fiber. Layout must match os/switch.S.
 Context :: struct {
     ra: u64,
@@ -110,11 +151,19 @@ Process :: struct {
     ctx:   Context,
     stack: []u8,
 
-    // Every process owns its mailbox and the memory behind it: send copies the
-    // payload into the *receiver's* arena, so a process holds no pointer into
+    // Every process owns its mailbox and the memory behind it: delivery copies
+    // the message into the *receiver's* slots, so a process holds no pointer into
     // another's memory. That is also what real isolation will require later,
     // where copying across address spaces is mandatory.
-    mailbox:   [dynamic]Message,
+    mailbox:      Mailbox,
+    backpressure: Backpressure,
+
+    // The most recently received message, copied out of the ring so its slot is
+    // free immediately. A Message handed to a process points in here, and stays
+    // valid until that process receives the next one.
+    staging: Slot,
+
+    // Backs the task stack and whatever the process allocates for itself.
     arena:     mem.Arena,
     allocator: mem.Allocator,
 }
@@ -154,16 +203,16 @@ fiber_main :: proc "c" (p: ^Process) {
 }
 
 @(private)
-process_init :: proc(k: ^Kernel, kind: ProcessKind) -> ^Process {
+process_init :: proc(k: ^Kernel, kind: ProcessKind, backpressure: Backpressure) -> ^Process {
     p := new(Process)
     p.id = ProcessId(len(k.processes))
     p.kind = kind
     p.kernel = k
+    p.backpressure = backpressure
 
     backing, _ := runtime.mem_alloc_non_zeroed(PROCESS_ARENA_SIZE, allocator = EMU_ALLOCATOR)
     mem.arena_init(&p.arena, backing)
     p.allocator = mem.arena_allocator(&p.arena)
-    p.mailbox = make([dynamic]Message, p.allocator)
 
     append(&k.processes, p)
     return p
@@ -172,8 +221,13 @@ process_init :: proc(k: ^Kernel, kind: ProcessKind) -> ^Process {
 // Register a reactive service: the kernel calls `on_message` once per delivered
 // message. `state` is an opaque pointer the handler owns; the kernel never looks
 // inside it. Starts Waiting -- idle until someone sends to it.
-spawn_service :: proc(k: ^Kernel, on_message: MessageHandler, state: rawptr = nil) -> ProcessId {
-    p := process_init(k, .Service)
+spawn_service :: proc(
+    k: ^Kernel,
+    on_message: MessageHandler,
+    state: rawptr = nil,
+    backpressure := Backpressure.RejectNewest,
+) -> ProcessId {
+    p := process_init(k, .Service, backpressure)
     p.on_message = on_message
     p.user_state = state
     p.state = .Waiting
@@ -183,8 +237,12 @@ spawn_service :: proc(k: ^Kernel, on_message: MessageHandler, state: rawptr = ni
 // Register an active task: `entry` runs on its own stack and owns its loop.
 // Starts Ready. The context is seeded so the first switch into it "returns" into
 // fiber_trampoline with s0 holding the process pointer.
-spawn_task :: proc(k: ^Kernel, entry: TaskEntry) -> ProcessId {
-    p := process_init(k, .Task)
+spawn_task :: proc(
+    k: ^Kernel,
+    entry: TaskEntry,
+    backpressure := Backpressure.RejectNewest,
+) -> ProcessId {
+    p := process_init(k, .Task, backpressure)
     p.entry = entry
     p.state = .Ready
 
@@ -200,52 +258,66 @@ spawn_task :: proc(k: ^Kernel, entry: TaskEntry) -> ProcessId {
 
 // --- Messaging -----------------------------------------------------------------
 
+// Copy a message into the receiver's mailbox. Returns false when it could not be
+// delivered -- unknown or dead target, or a full mailbox under RejectNewest.
 @(private)
-deliver :: proc(k: ^Kernel, from, to: ProcessId, tag: string, data: []u8) {
-    if int(to) < 0 || int(to) >= len(k.processes) do return
+deliver :: proc(k: ^Kernel, from, to: ProcessId, tag: string, data: []u8) -> bool {
+    if int(to) < 0 || int(to) >= len(k.processes) do return false
 
     target := k.processes[int(to)]
-    if target.state == .Dead do return
+    if target.state == .Dead do return false
 
-    // Copy into the receiver's arena so the sender can reuse its buffers and no
-    // pointer crosses a process boundary.
-    // NOTE: a process arena is not reclaimed until the process exits, so a
-    // long-lived mailbox only grows. A freeing mailbox allocator is a later task.
-    owned_tag := strings.clone(tag, target.allocator)
-    owned_data: []u8
-    if len(data) > 0 {
-        owned_data = make([]u8, len(data), target.allocator)
-        copy(owned_data, data)
+    // Inline storage is fixed, so oversized messages are a programming error
+    // rather than something to silently truncate.
+    assert(len(tag) <= MESSAGE_TAG_MAX, "message tag exceeds MESSAGE_TAG_MAX")
+    assert(len(data) <= MESSAGE_DATA_MAX, "message payload exceeds MESSAGE_DATA_MAX")
+
+    mb := &target.mailbox
+
+    if mb.count == MAILBOX_CAPACITY {
+        switch target.backpressure {
+        case .RejectNewest:
+            mb.dropped += 1
+            return false
+        case .DropOldest:
+            mb.head = (mb.head + 1) % MAILBOX_CAPACITY
+            mb.count -= 1
+            mb.dropped += 1
+        }
     }
 
-    // An exhausted process arena makes append a silent no-op, which shows up
-    // much later as a receiver that blocks forever. Fail here instead.
-    before := len(target.mailbox)
-    append(&target.mailbox, Message{from = from, tag = owned_tag, data = owned_data})
-    assert(len(target.mailbox) == before + 1, "mailbox append failed: process arena exhausted")
+    slot := &mb.slots[(mb.head + mb.count) % MAILBOX_CAPACITY]
+    slot.from = from
+    slot.tag_len = len(tag)
+    slot.data_len = len(data)
+    copy(slot.tag_buf[:], transmute([]u8)tag)
+    copy(slot.data_buf[:], data)
+    mb.count += 1
 
     if target.state == .Waiting do target.state = .Ready
+    return true
 }
 
-// Send from one process to another.
-send :: proc(p: ^Process, to: ProcessId, tag: string, data: []u8 = nil) {
-    deliver(p.kernel, p.id, to, tag, data)
+// Send from one process to another. False means the message was not delivered,
+// which under RejectNewest is the sender's cue to retry or back off.
+send :: proc(p: ^Process, to: ProcessId, tag: string, data: []u8 = nil) -> bool {
+    return deliver(p.kernel, p.id, to, tag, data)
 }
 
 // Send a plain-old-data value as the payload. Pair with message_value to read it.
-send_value :: proc(p: ^Process, to: ProcessId, tag: string, value: $T) {
+send_value :: proc(p: ^Process, to: ProcessId, tag: string, value: $T) -> bool {
     v := value
-    deliver(p.kernel, p.id, to, tag, slice.bytes_from_ptr(&v, size_of(T)))
+    return deliver(p.kernel, p.id, to, tag, slice.bytes_from_ptr(&v, size_of(T)))
 }
 
 // Post from the kernel itself, with no sending process (used by boot).
-post :: proc(k: ^Kernel, to: ProcessId, tag: string, data: []u8 = nil) {
-    deliver(k, NO_PROCESS, to, tag, data)
+post :: proc(k: ^Kernel, to: ProcessId, tag: string, data: []u8 = nil) -> bool {
+    return deliver(k, NO_PROCESS, to, tag, data)
 }
 
-post_value :: proc(k: ^Kernel, to: ProcessId, tag: string, value: $T) {
+post_value :: proc(k: ^Kernel, to: ProcessId, tag: string, value: $T) -> bool {
     v := value
-    deliver(k, NO_PROCESS, to, tag, slice.bytes_from_ptr(&v, size_of(T)))
+    return deliver(k, NO_PROCESS, to, tag, slice.bytes_from_ptr(&v, size_of(T)))
 }
 
 // Reinterpret a message payload as a value of type T.
@@ -254,12 +326,23 @@ message_value :: proc(msg: Message, $T: typeid) -> T {
     return (cast(^T)raw_data(msg.data))^
 }
 
+// Take the oldest message, copying it into the process's staging slot so the ring
+// position frees up right away. The returned Message points into that staging
+// slot: it stays valid until this process receives its next message.
 @(private)
 mailbox_pop :: proc(p: ^Process) -> (msg: Message, ok: bool) {
-    if len(p.mailbox) == 0 do return {}, false
-    msg = p.mailbox[0]
-    ordered_remove(&p.mailbox, 0)
-    return msg, true
+    mb := &p.mailbox
+    if mb.count == 0 do return {}, false
+
+    p.staging = mb.slots[mb.head]
+    mb.head = (mb.head + 1) % MAILBOX_CAPACITY
+    mb.count -= 1
+
+    return Message {
+        from = p.staging.from,
+        tag = string(p.staging.tag_buf[:p.staging.tag_len]),
+        data = p.staging.data_buf[:p.staging.data_len],
+    }, true
 }
 
 // --- Task-only primitives ------------------------------------------------------
@@ -276,7 +359,7 @@ yield :: proc(p: ^Process) {
 // Block until a message arrives, then take it.
 recv :: proc(p: ^Process) -> Message {
     assert(p.kind == .Task, "recv is only valid inside a task")
-    for len(p.mailbox) == 0 {
+    for p.mailbox.count == 0 {
         p.state = .Waiting
         ctx_switch(&p.ctx, &p.kernel.sched_ctx)
     }
@@ -321,7 +404,7 @@ schedule :: proc(k: ^Kernel) {
                     p.on_message(p, msg)
                 }
                 // Stay Ready while mail remains, so the next turn drains it.
-                if len(p.mailbox) == 0 && p.state == .Ready {
+                if p.mailbox.count == 0 && p.state == .Ready {
                     p.state = .Waiting
                 }
 
@@ -337,12 +420,13 @@ schedule :: proc(k: ^Kernel) {
     }
 }
 
-// Release everything a dead process owns in one shot: mailbox, stack, and state
-// all live in its arena.
+// Release everything a dead process owns in one shot. The mailbox is inline
+// storage that dies with the process; the stack and anything it allocated live
+// in its arena.
 @(private)
 process_free :: proc(p: ^Process) {
     free_all(p.allocator)
-    p.mailbox = nil
+    p.mailbox = {}
     p.stack = nil
 }
 

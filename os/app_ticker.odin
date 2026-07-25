@@ -27,9 +27,27 @@ ticker_task :: proc(p: ^Process) {
         yield(p)
     }
 
-    // Blocking request/reply. It must be a selective receive: a late "stop" can
-    // already be queued ahead of the reply we want.
-    send(p, counter, "get")
+    // Burst without yielding, so the service gets no chance to drain. Delivery
+    // stops at MAILBOX_CAPACITY and the rest come back refused -- refused, not
+    // silently discarded, which is the whole point of reject-newest.
+    accepted, refused := 0, 0
+    for _ in 0 ..< MAILBOX_CAPACITY + 4 {
+        if send(p, counter, "inc") {
+            accepted += 1
+        } else {
+            refused += 1
+        }
+    }
+    kprint("ticker: burst accepted=%d refused=%d\n", accepted, refused)
+
+    // Its mailbox is full, so this request would be refused too. Yield until it
+    // has drained enough to accept -- a well-behaved sender backs off rather
+    // than dropping work on the floor.
+    for !send(p, counter, "get") {
+        yield(p)
+    }
+
+    // Selective receive: unrelated mail may be queued ahead of the reply.
     reply := recv_tag(p, "value")
     kprint("ticker: final value = %d\n", message_value(reply, int))
 }

@@ -8,8 +8,9 @@ package kernel
 // This is the cheap, common shape: most processes only react.
 
 Counter :: struct {
-    count: int,
-    limit: int,
+    count:   int,
+    limit:   int,
+    stopped: bool,
 }
 
 count_service :: proc(p: ^Process, msg: Message) {
@@ -21,8 +22,10 @@ count_service :: proc(p: ^Process, msg: Message) {
         kprint("  counter: count = %d\n", c.count)
 
         // Services can steer their callers: tell the ticker when we have had
-        // enough rather than letting it decide.
-        if c.count >= c.limit {
+        // enough rather than letting it decide. Once is enough -- repeating it
+        // would just fill the ticker's mailbox with redundant mail.
+        if c.count >= c.limit && !c.stopped {
+            c.stopped = true
             send(p, msg.from, "stop")
         }
 
