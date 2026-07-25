@@ -9,6 +9,13 @@ emu_os:
 	riscv64-none-elf-gcc -c os/trap.S -ffreestanding -o os/bin/trap.o
 	riscv64-none-elf-ld -T os/kernel.ld os/bin/kernel-* os/bin/switch.o os/bin/trap.o --just-symbols bin/stdlib.elf -o os/bin/kernel.elf
 
+emu_apps:
+	mkdir -p apps/bin
+	-rm apps/bin/*.o apps/bin/*.elf
+	odin build apps/counter -target:freestanding_riscv64 -build-mode:object -default-to-nil-allocator -no-thread-local -no-rpath -no-crt -o:none -out:apps/bin/counter.o
+	riscv64-none-elf-gcc -c sdk/app/syscall.S -ffreestanding -o apps/bin/syscall.o
+	riscv64-none-elf-ld -T sdk/app/link.ld apps/bin/counter-* apps/bin/syscall.o -o apps/bin/counter.elf
+
 examples: emu-hello-example emu-host-to-guest-example
 
 emu-gui: src/*.odin src/**/*.odin
