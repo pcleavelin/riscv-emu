@@ -44,6 +44,9 @@ _start :: proc() {
 
     trap_init() // route traps to the kernel before anything can cause one
 
+    frame_pool_init() // a page table is a frame, so this comes before paging
+    frame_pool_check()
+
     kernel_root = paging_init()
     kprint("kernel: paging on, satp=%x\n", csr_read_satp())
 
@@ -56,6 +59,7 @@ _start :: proc() {
             kprint("kernel: process %d lost %d message(s) to overflow\n", p.id, p.mailbox.dropped)
         }
     }
+    frame_pool_report()
     kprint("kernel: idle, shutting down\n")
 }
 
@@ -514,18 +518,23 @@ schedule :: proc(k: ^Kernel) {
     }
 }
 
-// Release everything a dead process owns in one shot. The mailbox is inline
-// storage that dies with the process; the stack and anything it allocated live
-// in its arena.
+// Release everything a dead process owns. The mailbox is inline storage that dies
+// with the process, and the stack and anything it allocated live in its arena, so
+// those go in one shot. A user process also owns an address space, whose frames
+// come from the frame pool and are handed back one by one.
 //
-// A user process's page tables and frames are not reclaimed yet. They come from
-// the kernel heap rather than the arena, so freeing them needs the address space
-// walked and every frame handed back.
+// The scheduler puts satp back on the kernel's own root before calling this, which
+// it must: these are the mappings the process was running on.
 @(private)
 process_free :: proc(p: ^Process) {
     free_all(p.allocator)
     p.mailbox = {}
     p.stack = nil
+
+    if p.root != nil {
+        free_address_space(p.root)
+        p.root = nil
+    }
 }
 
 // --- Utilities -----------------------------------------------------------------

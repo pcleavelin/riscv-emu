@@ -56,8 +56,13 @@ LoadedImage :: struct {
 // space contains the kernel as well, because a trap does not change satp, but
 // only the app's own pages carry PTE_U.
 load_image :: proc(name: string) -> (img: LoadedImage, ok: bool) {
-    // Nothing reclaims the staging buffer: the kernel heap is an arena. Loading
-    // happens at boot, so an image costs its own size in heap once.
+    // The staging buffer is temporary, so the arena is rolled back to where it
+    // stood once the segments have been copied out of it. Everything the loader
+    // keeps -- frames and page tables -- comes from the frame pool instead, so
+    // nothing that must survive lives inside the region discarded here.
+    mark := EMU_ARENA.offset
+    defer EMU_ARENA.offset = mark
+
     image := image_load(name) or_return
     if !elf_is_loadable(image, name) do return {}, false
 

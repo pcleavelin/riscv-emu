@@ -9,6 +9,7 @@ package kernel
 // rather than a million.
 
 import "core:mem"
+import "core:slice"
 
 // --- Kernel memory map ---------------------------------------------------------
 //
@@ -18,12 +19,20 @@ import "core:mem"
 //
 //   0x8000_0000  kernel image    512K, reserved by os/kernel.ld
 //   0x8008_0000  stdlib runtime  512K, reserved by stdlib/link.ld
-//   0x8010_0000  kernel heap     grows up
+//   0x8010_0000  kernel heap     256MB, an arena, grows up
+//   0x9010_0000  frame pool      256MB, 4KB frames, handed out and taken back
 //   0xC000_0000  kernel stack    grows down, set by the emulator's boot vector
 
 KERNEL_BASE :: u64(0x8000_0000)
 KERNEL_HEAP_BASE :: uintptr(0x8010_0000)
 KERNEL_HEAP_SIZE :: 256 * 1024 * 1024
+
+// Frames live in a region of their own, immediately past the heap, because they
+// must come back: the page tables and pages of a dead process are the bulk of what
+// it owned, and the heap is an arena that can only be freed all at once.
+FRAME_POOL_BASE :: u64(KERNEL_HEAP_BASE) + KERNEL_HEAP_SIZE
+FRAME_POOL_SIZE :: 256 * 1024 * 1024
+FRAME_POOL_END :: FRAME_POOL_BASE + FRAME_POOL_SIZE
 
 PAGE_SIZE :: 4096
 PTE_PER_PAGE :: 512
@@ -60,13 +69,102 @@ page_up :: proc(addr: u64) -> u64 {
     return page_base(addr + PAGE_SIZE - 1)
 }
 
-// Allocate one zeroed, page-aligned frame. Alignment is not optional: satp and
-// the page table entries store a frame number, so the low 12 bits must be zero.
+// --- The frame allocator -------------------------------------------------------
+//
+// Every frame is the same size, so there is nothing to search: a free frame is
+// simply on a list. The list is threaded through the free frames themselves, each
+// holding the address of the next in its first eight bytes, so tracking them costs
+// no memory of its own and freeing one is a couple of stores.
+//
+// Frames beyond the ones that have already been freed come off a bump pointer.
+// That way the pool costs only what has been touched, which matters because the
+// machine's physical memory is far smaller than the region reserved here.
+//
+// Addresses here are physical. Using them as Odin pointers is only correct while
+// the kernel is identity mapped, which is the same assumption map_page and walk
+// make.
+
+@(private) frame_free_list: u64 // first free frame, or zero when the list is empty
+@(private) frame_next_new: u64  // the next frame never yet handed out
+
+frames_in_use: int
+frames_peak: int
+
+// Arm the bump pointer. Must run before anything allocates, which means before
+// paging_init, since a page table is a frame.
+frame_pool_init :: proc() {
+    frame_free_list = 0
+    frame_next_new = FRAME_POOL_BASE
+    frames_in_use = 0
+    frames_peak = 0
+}
+
+// Check that a freed frame comes back out again. The counters alone would not
+// notice a broken free list -- they would keep tallying while every allocation
+// quietly came off the bump pointer and the pool grew forever.
+//
+// The frame left on the list is not waste: the next allocation takes it.
+frame_pool_check :: proc() {
+    first := frame_paddr(alloc_frame())
+    free_frame(first)
+
+    again := frame_paddr(alloc_frame())
+    assert(again == first, "a freed frame was not handed back out")
+    free_frame(again)
+}
+
+// Take one zeroed, page-aligned frame. Alignment is not optional: satp and the
+// page table entries store a frame number, so the low 12 bits must be zero -- and
+// the pool being page-aligned is what guarantees it.
+//
+// Callers rely on a fresh frame being zero: it is what makes a page table valid to
+// walk and what makes an application's bss cost nothing to clear.
 alloc_frame :: proc() -> []u8 {
-    frame, err := mem.alloc_bytes(PAGE_SIZE, PAGE_SIZE, EMU_ALLOCATOR)
-    assert(err == nil, "out of memory allocating a frame")
-    assert(uintptr(raw_data(frame)) & (PAGE_SIZE - 1) == 0, "frame is not page-aligned")
+    paddr := frame_free_list
+
+    if paddr != 0 {
+        frame_free_list = (^u64)(uintptr(paddr))^
+    } else {
+        assert(frame_next_new < FRAME_POOL_END, "out of frames")
+        paddr = frame_next_new
+        frame_next_new += PAGE_SIZE
+    }
+
+    frames_in_use += 1
+    if frames_in_use > frames_peak do frames_peak = frames_in_use
+
+    frame := slice.bytes_from_ptr(rawptr(uintptr(paddr)), PAGE_SIZE)
+    mem.zero(raw_data(frame), PAGE_SIZE)
     return frame
+}
+
+// Report the pool, and check that it adds up: every frame ever taken from the bump
+// pointer is either in use or on the free list. A frame freed twice would sit on
+// the list twice and make the totals disagree, or, if the two frees formed a cycle,
+// run the walk past the number of frames that exist.
+frame_pool_report :: proc() {
+    taken := int((frame_next_new - FRAME_POOL_BASE) / PAGE_SIZE)
+
+    free_count := 0
+    for frame := frame_free_list; frame != 0; frame = (^u64)(uintptr(frame))^ {
+        free_count += 1
+        assert(free_count <= taken, "the frame free list has a cycle")
+    }
+
+    kprint("kernel: frames %d in use, %d free, %d at peak\n",
+        frames_in_use, free_count, frames_peak)
+    assert(frames_in_use + free_count == taken, "frames have gone missing from the pool")
+}
+
+// Give a frame back. It goes on the head of the free list, so the next allocation
+// reuses the most recently freed frame and the pool stays as compact as it can.
+free_frame :: proc(paddr: u64) {
+    assert(paddr >= FRAME_POOL_BASE && paddr < FRAME_POOL_END, "that address is not a frame")
+    assert(paddr & (PAGE_SIZE - 1) == 0, "that address is not the start of a frame")
+
+    (^u64)(uintptr(paddr))^ = frame_free_list
+    frame_free_list = paddr
+    frames_in_use -= 1
 }
 
 // The physical address of a frame. The kernel is identity mapped, so a frame's
@@ -166,6 +264,49 @@ create_address_space :: proc() -> ^PageTable {
     space := alloc_page_table()
     space^ = kernel_root^
     return space
+}
+
+// Give back everything an address space owns: the frames its pages point at, and
+// the tables that map them.
+//
+// Only the part below KERNEL_BASE is the process's. The entries above it were
+// copied from kernel_root by create_address_space and are shared by every address
+// space, so following them would free the kernel out from under itself.
+//
+// The caller must not be running on this address space any more.
+free_address_space :: proc(root: ^PageTable) {
+    for i in 0 ..< int(KERNEL_BASE >> 30) {
+        if (root[i] & PTE_V) == 0 do continue
+        free_subtree(root[i], 2)
+        root[i] = 0
+    }
+
+    free_frame(u64(uintptr(root)))
+}
+
+// Free one entry and everything below it: a leaf owns a frame, anything else owns
+// a table whose own entries have to go first. `level` is the level the entry itself
+// lives at, so it counts down to zero at the bottom.
+@(private)
+free_subtree :: proc(entry: u64, level: int) {
+    paddr := (entry >> 10) << 12
+
+    if entry & (PTE_R | PTE_W | PTE_X) != 0 {
+        // The loader maps user space in 4KB pages only, so a leaf down here owns
+        // exactly one frame. A superpage would own 512 or more of them at once.
+        assert(level == 0, "a superpage cannot be freed as a single frame")
+        free_frame(paddr)
+        return
+    }
+
+    assert(level > 0, "a bottom-level entry must be a leaf")
+
+    table := cast(^PageTable)uintptr(paddr)
+    for i in 0 ..< PTE_PER_PAGE {
+        if (table[i] & PTE_V) != 0 do free_subtree(table[i], level - 1)
+    }
+
+    free_frame(paddr)
 }
 
 // Point satp at a root table and switch to Sv39.
