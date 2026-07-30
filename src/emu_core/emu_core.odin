@@ -16,9 +16,10 @@ REG_RA :: 1 // x1, the return-address register
 // so it is never a valid instruction address.
 EMU_HALT_VECTOR :: u64(0xFFFF_FFFF_FFFF_FFF0)
 
-// Initial guest stack pointer: the stack grows down from just below the address
-// the bootloader image is linked at. emu_boot installs it in sp.
-EMU_STACK_TOP :: u64(0x8000_0000)
+// Initial guest stack pointer, installed in sp by emu_boot. The stack grows down
+// from the top of the kernel's 1GB region, well above the image and its heap, so
+// everything the kernel touches sits in the one region it identity maps.
+EMU_STACK_TOP :: u64(0xC000_0000)
 
 // Why the machine stopped advancing. emu_run stops on any value other than .None.
 StopReason :: enum {
@@ -52,7 +53,8 @@ CSR_SATP     :: 0x180
 // sstatus bits used by trap entry and exit.
 SSTATUS_SIE  :: u64(1) << 1 // supervisor interrupts enabled
 SSTATUS_SPIE :: u64(1) << 5 // interrupt-enable state saved on trap entry
-SSTATUS_SPP  :: u64(1) << 8 // privilege level the trap came from (1 = S, 0 = U)
+SSTATUS_SPP  :: u64(1) << 8  // privilege level the trap came from (1 = S, 0 = U)
+SSTATUS_SUM  :: u64(1) << 18 // permit supervisor loads and stores to user pages
 
 // scause values for the traps the emulator raises.
 CAUSE_ECALL_FROM_U   :: u64(8)
@@ -531,10 +533,18 @@ emu_translate :: proc(e: ^Emu64, vaddr: u64, access: MemAccess) -> u64 {
             case .Store: if (pte & PTE_W) == 0 do return fault(e, vaddr, access)
         }
 
-        // U pages belong to user mode, and the supervisor may not stray into them
-        // (no SUM here). Anything else is off limits to user mode.
+        // A page without U is off limits to user mode.
         if e.mode == .User && (pte & PTE_U) == 0 do return fault(e, vaddr, access)
-        if e.mode == .Supervisor && (pte & PTE_U) != 0 do return fault(e, vaddr, access)
+
+        // The supervisor may reach into user pages only while SUM is set, and
+        // then only for data: executing user code as the kernel is never allowed,
+        // whatever SUM says.
+        if e.mode == .Supervisor && (pte & PTE_U) != 0 {
+            if access == .Fetch do return fault(e, vaddr, access)
+            if (emu_read_csr(e, CSR_SSTATUS) & SSTATUS_SUM) == 0 {
+                return fault(e, vaddr, access)
+            }
+        }
 
         // For a superpage the levels below the leaf come from the virtual address.
         ppn := (pte >> 10) & 0xFFF_FFFF_FFFF

@@ -10,6 +10,21 @@ package kernel
 
 import "core:mem"
 
+// --- Kernel memory map ---------------------------------------------------------
+//
+// The kernel lives entirely inside one 1GB region and identity maps just that,
+// which leaves the whole low half of every address space to user processes. The
+// first two megabytes are reserved by the link scripts:
+//
+//   0x8000_0000  kernel image    512K, reserved by os/kernel.ld
+//   0x8008_0000  stdlib runtime  512K, reserved by stdlib/link.ld
+//   0x8010_0000  kernel heap     grows up
+//   0xC000_0000  kernel stack    grows down, set by the emulator's boot vector
+
+KERNEL_BASE :: u64(0x8000_0000)
+KERNEL_HEAP_BASE :: uintptr(0x8010_0000)
+KERNEL_HEAP_SIZE :: 256 * 1024 * 1024
+
 PAGE_SIZE :: 4096
 PTE_PER_PAGE :: 512
 
@@ -91,12 +106,10 @@ map_page :: proc(root: ^PageTable, vaddr: u64, paddr: u64, flags: u64) {
 paging_init :: proc() -> ^PageTable {
     root := alloc_page_table()
 
-    // Four 1GB pages cover everything in use: the guest arena low down and the
-    // kernel image at 0x8000_0000. Supervisor-only, since no U flag is set.
-    for i in 0 ..< u64(4) {
-        base := i << 30
-        map_gigapage(root, base, base, PTE_R | PTE_W | PTE_X)
-    }
+    // A single 1GB page covers the image, the runtime, the heap and the stack.
+    // No U flag, so nothing here is reachable from user mode -- and everything
+    // below KERNEL_BASE is left unmapped, free for processes to occupy.
+    map_gigapage(root, KERNEL_BASE, KERNEL_BASE, PTE_R | PTE_W | PTE_X)
 
     satp_write_root(root)
     return root

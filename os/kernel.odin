@@ -11,6 +11,7 @@ import "core:mem"
 import "core:slice"
 
 import emu "../bindings/odin"
+import "../sdk/abi"
 
 EMU_ARENA: mem.Arena
 EMU_TEMP_ARENA: mem.Arena
@@ -25,7 +26,7 @@ kernel_root: ^PageTable
 
 @(export)
 _start :: proc() {
-    data := slice.bytes_from_ptr(rawptr(uintptr(0x4000)), 1024 * 1024 * 512)
+    data := slice.bytes_from_ptr(rawptr(KERNEL_HEAP_BASE), KERNEL_HEAP_SIZE)
     mem.arena_init(&EMU_ARENA, data)
 
     EMU_ALLOCATOR = mem.arena_allocator(&EMU_ARENA)
@@ -65,21 +66,24 @@ _start :: proc() {
     address_space_demo()
 }
 
-// Show that a mapping belongs to an address space rather than to the machine:
-// the same virtual address is memory in one space and a fault in another.
-PRIVATE_VA :: u64(0x1_0000_0000) // above the kernel's identity map
-
+// Show that a mapping belongs to an address space rather than to the machine.
+// The address used is the one an app image is linked at, so this also confirms
+// the low half is free now that the kernel has consolidated itself high.
 address_space_demo :: proc() {
     space := create_address_space()
 
     frame, err := mem.alloc(PAGE_SIZE, PAGE_SIZE, EMU_ALLOCATOR)
     assert(err == nil, "out of memory")
-    map_page(space, PRIVATE_VA, u64(uintptr(frame)), PTE_R | PTE_W)
+    map_page(space, abi.USER_TEXT_BASE, u64(uintptr(frame)), PTE_R | PTE_W | PTE_U)
 
     satp_write_root(space)
-    private := (^u64)(uintptr(PRIVATE_VA))
+    private := (^u64)(uintptr(abi.USER_TEXT_BASE))
+
+    // The page is marked for user access, so the kernel needs the window open.
+    user_access_begin()
     private^ = 0xC0FFEE
-    kprint("kernel: in the new space, 0x%x reads %x\n", PRIVATE_VA, private^)
+    kprint("kernel: in the new space, 0x%x reads %x\n", u64(abi.USER_TEXT_BASE), private^)
+    user_access_end()
 
     satp_write_root(kernel_root)
     kprint("kernel: back in the kernel space, that address is gone\n")

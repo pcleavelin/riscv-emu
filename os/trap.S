@@ -238,3 +238,20 @@ csr_write_satp:
 csr_read_satp:
     csrr a0, satp
     ret
+
+/*
+ * Bracket accesses to user memory. Between these the kernel may load and store
+ * through user mappings; outside them a stray user-pointer dereference faults,
+ * which is the point of keeping the window narrow.
+ */
+.globl user_access_begin
+user_access_begin:
+    li   t0, (1 << 18)              /* sstatus.SUM */
+    csrs sstatus, t0
+    ret
+
+.globl user_access_end
+user_access_end:
+    li   t0, (1 << 18)
+    csrc sstatus, t0
+    ret

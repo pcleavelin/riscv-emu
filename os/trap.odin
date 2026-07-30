@@ -45,6 +45,10 @@ foreign trap_asm {
     csr_write_sepc :: proc(value: u64) ---
     csr_read_stval :: proc() -> u64 ---
     csr_write_stvec :: proc(value: u64) ---
+
+    // Open and close the window in which the kernel may touch user memory.
+    user_access_begin :: proc() ---
+    user_access_end :: proc() ---
 }
 
 // Where a user process returns to when it exits. Saved by user_enter.
