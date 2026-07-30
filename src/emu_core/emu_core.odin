@@ -257,7 +257,7 @@ InstrMnemonic :: enum u8 {
     C_SRLI, C_SRAI, C_ANDI,
     C_MV,
     C_ADD,
-    C_SUB, C_SUBW, C_XOR, C_OR, C_AND,
+    C_SUB, C_SUBW, C_ADDW, C_XOR, C_OR, C_AND,
     C_LW, C_LD, C_LWSP, C_LDSP,
     C_SW, C_SD, C_SWSP, C_SDSP,
 
@@ -859,7 +859,7 @@ emu_disasm :: proc(e: ^Emu64, addr: u64, allocator := context.temp_allocator) ->
         case .ADD, .SUB, .SLL, .SLT, .SLTU, .XOR, .SRL, .SRA, .OR, .AND,
              .MUL, .MULH, .MULHSU, .MULHU, .DIV, .DIVU, .REM, .REMU,
              .ADDW, .SUBW, .MULW, .SLLW, .SRLW, .SRAW,
-             .C_ADD, .C_SUB, .C_SUBW, .C_XOR, .C_OR, .C_AND, .C_MV:
+             .C_ADD, .C_SUB, .C_SUBW, .C_ADDW, .C_XOR, .C_OR, .C_AND, .C_MV:
             fmt.sbprintf(&b, "%s %s, %s, %s", mnem, abi_name(op.rd), abi_name(op.rs1), abi_name(op.rs2))
 
         case .ADDI, .SLTI, .SLTIU, .XORI, .ORI, .ANDI, .SLLI, .SRLI, .SRAI,
@@ -1608,6 +1608,14 @@ decode_rvc_q1 :: proc(e: ^Emu64, instr: u16, result: ^Instr) {
                         result.op.rs1_val = emu_read_reg_cext(e, int(rd))
                         result.op.rs2_val = emu_read_reg_cext(e, int(rs2))
                     }
+                    case 0b01: {
+                        result.mnemonic = .C_ADDW
+                        result.op.rd = u8(rd) + 8
+                        result.op.rs1 = u8(rd) + 8
+                        result.op.rs2 = u8(rs2) + 8
+                        result.op.rs1_val = emu_read_reg_cext(e, int(rd))
+                        result.op.rs2_val = emu_read_reg_cext(e, int(rs2))
+                    }
                 }
             } else {
                 imm := (instr >> 2) & 0x1F
@@ -2212,6 +2220,13 @@ emu_eval_instr :: proc(e: ^Emu64, di: Instr) -> (pc_offset: u64, cont: bool) {
             emu_write_reg(e, int(di.op.rd), u64(i64(i32(rd_val))))
             return u64(di.length), true
         }
+        case .C_ADDW: {
+            rs2_val := u32(di.op.rs2_val & 0xFFFFFFFF)
+            rd_val := u32(di.op.rs1_val & 0xFFFFFFFF)
+            rd_val += rs2_val
+            emu_write_reg(e, int(di.op.rd), u64(i64(i32(rd_val))))
+            return u64(di.length), true
+        }
 
         // --- Branches ---
         case .C_BEQZ: fallthrough
@@ -2768,7 +2783,15 @@ emu_deliver_fault :: proc(e: ^Emu64, epc: u64) {
 emu_run :: proc(e: ^Emu64) -> StopReason {
     for {
         r := emu_step(e)
-        if r != .None do return r
+        if r == .None do continue
+
+        // An undecodable instruction says nothing about where the guest went
+        // wrong, and by then the pc is the only clue left. Report it.
+        if r == .Invalid {
+            fmt.eprintf("\nundecodable instruction at pc=0x%x, mode=%v\n\n", e.pc, e.mode)
+        }
+
+        return r
     }
 }
 
