@@ -67,6 +67,7 @@
 #ifdef HAVE_RISCV_MEMSET
 .section .text.memset, "ax", @progbits
 .globl memset_asm
+.type memset_asm, @function
 .type memset, @function
     /*
     // void *_memset(void *dst, int ch, size_t sz)
@@ -81,6 +82,7 @@
     // Code size (bytes): rv64ic: 178, rv64i: 280, rv32ic: 172, rv32i: 268
     */
 .align 2
+memset_asm:
 memset:
     li    a4, 2*SZREG           // threshold for bytewise operations
     mv    a5, a0                // preserve a0 as return value, further a5 is 'dst'
@@ -178,6 +180,8 @@ memset:
 #ifdef HAVE_RISCV_MEMCPY
 .section .text.memcpy, "ax", @progbits
 .globl memcpy
+.globl memcpy_asm
+.type memcpy_asm, @function
 .type memcpy, @function
     /*
     // void *_memcpy(void *dst, void *src, size_t sz)
@@ -189,6 +193,7 @@ memset:
     // if HAVE_RISCV_MEMCPY_UNALIGNED is not defined.
     */
 .align 2
+memcpy_asm:
 memcpy:
 #ifdef HAVE_RISCV_MEMCPY_UNALIGNED
     li    a4, 3*SZREG           // threshold for byte-by-byte copying

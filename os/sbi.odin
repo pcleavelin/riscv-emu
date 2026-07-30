@@ -7,6 +7,8 @@ package kernel
 // so the bytes have to come from outside: the kernel asks for a size, stages a
 // buffer, and asks for the bytes.
 
+import "base:runtime"
+
 SBI_IMAGE_SIZE :: 0x20 // (name_ptr, name_len) -> size in bytes, 0 if unknown
 SBI_IMAGE_READ :: 0x21 // (name_ptr, name_len, dest) -> bytes written
 
@@ -58,7 +60,12 @@ image_load :: proc(name: string, allocator := context.allocator) -> (image: []u8
     size := image_size(name)
     if size == 0 do return nil, false
 
-    buf := make([]u8, size, allocator)
+    // Not zeroed first: the read overwrites every byte of it, and clearing a
+    // third of a megabyte through the runtime's memset costs more than the read
+    // that follows it.
+    buf, err := runtime.mem_alloc_non_zeroed(int(size), allocator = allocator)
+    if err != nil do return nil, false
+
     if image_read(name, buf) != size do return nil, false
 
     return buf, true

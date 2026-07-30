@@ -117,7 +117,11 @@ map_segment :: proc(space: ^PageTable, image: []u8, ph: u64) {
         from := max(page, vaddr)
         to := min(page + PAGE_SIZE, vaddr + filesz)
         if from < to {
-            copy(frame[from - page:], image[offset + from - vaddr:offset + to - vaddr])
+            memcpy_asm(
+                rawptr(&frame[from - page]),
+                rawptr(&image[offset + from - vaddr]),
+                uint(to - from),
+            )
         }
     }
 }

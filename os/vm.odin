@@ -8,7 +8,6 @@ package kernel
 // 2MB or 1GB, which is what makes the kernel's identity map a handful of entries
 // rather than a million.
 
-import "core:mem"
 import "core:slice"
 
 // --- Kernel memory map ---------------------------------------------------------
@@ -57,6 +56,14 @@ foreign import vm_asm "system:vm_asm"
 foreign vm_asm {
     csr_write_satp :: proc(value: u64) ---
     csr_read_satp :: proc() -> u64 ---
+
+    // The hand-written routines in stdlib/memops.S, which move a register at a
+    // time instead of a byte. Reached under aliases because the plain names are
+    // already taken: the compiler emits its own memset and memcpy into the kernel
+    // object, and those win at link. Clearing and copying pages is the bulk of
+    // what starting a process costs, so which one gets called is worth 6x.
+    memset_asm :: proc(dst: rawptr, value: i32, size: uint) -> rawptr ---
+    memcpy_asm :: proc(dst: rawptr, src: rawptr, size: uint) -> rawptr ---
 }
 
 // The first address of the page that holds `addr`, and the first address of the
@@ -133,9 +140,9 @@ alloc_frame :: proc() -> []u8 {
     frames_in_use += 1
     if frames_in_use > frames_peak do frames_peak = frames_in_use
 
-    frame := slice.bytes_from_ptr(rawptr(uintptr(paddr)), PAGE_SIZE)
-    mem.zero(raw_data(frame), PAGE_SIZE)
-    return frame
+    memset_asm(rawptr(uintptr(paddr)), 0, PAGE_SIZE)
+
+    return slice.bytes_from_ptr(rawptr(uintptr(paddr)), PAGE_SIZE)
 }
 
 // Report the pool, and check that it adds up: every frame ever taken from the bump

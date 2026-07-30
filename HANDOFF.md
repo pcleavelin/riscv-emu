@@ -52,12 +52,20 @@ Version control is **jujutsu (`jj`), never git**. Note `main` still points at
 Booting `./bin/emu` loads `bin/stdlib.elf` and `os/bin/kernel.elf`, enters the
 kernel in supervisor mode, and runs to a clean halt.
 
-Along the way it turns on paging and starts four processes: an in-kernel counter
-service, an in-kernel ticker task that drives it, the same counter *again* as a
-user-mode process loaded from `apps/bin/counter.elf`, and a second ticker driving
-that one. Both counters answer the same protocol and reach 21; neither ticker can
-tell which side of the privilege boundary it is talking to. The user process then
-exits by syscall and the kernel reclaims it.
+Along the way it turns on paging and starts seven processes:
+
+- An in-kernel counter service and an in-kernel ticker task that drives it.
+- The same counter *again* as a user process loaded from `apps/bin/counter.elf`,
+  with a second ticker driving that one. Neither ticker can tell which side of the
+  privilege boundary it is talking to — though since preemption the two no longer
+  run in step, which is why the user counter finishes at 22 rather than 21 and its
+  burst is refused differently. Both outcomes are correct; the interleaving is not
+  the same, and reject-newest reports every refusal either way.
+- Two `apps/bin/pixels.elf` processes passing a 16K frame back and forth as a
+  grant.
+- One `apps/bin/spin.elf` that never yields, to be preempted.
+
+Each user process exits by syscall and the kernel reclaims everything it owned.
 
 Commits, oldest first:
 
@@ -95,6 +103,7 @@ Commits, oldest first:
 | `sbi.odin`, `sbi.S` | supervisor ecalls out to the host; fetching app images |
 | `loader.odin` | ELF64 loader: an image becomes an address space |
 | `grant.odin` | memory grants: blocks that move between processes |
+| `timer.odin` | preemption: the timer that takes the CPU back |
 | `boot.odin` | which processes the system starts with, and on which side |
 | `app_counter.odin`, `app_ticker.odin` | in-kernel example processes |
 
@@ -316,18 +325,41 @@ intact, and the frame accounting still balanced — the painter died while the
 *display* owned the grant, so `grants_release` had to skip a grant it no longer
 owned and `free_address_space` had to not collect the transferred frames.
 
+**Preemption works, for user code only.** The machine counts one tick per
+instruction retired; `SBI_SET_TIMER` arms a deadline and `SBI_TIME` reads the
+clock. When the deadline passes the host raises a supervisor timer interrupt, and
+`trap_handler` calls `yield` on the running process — which costs nothing new,
+because a user process is already a fiber whose trap frame sits on its own kernel
+stack. Being preempted is the same `ctx_switch` a blocking syscall does.
+
+The kernel runs with `sstatus.SIE` clear and never sets it, so an interrupt is only
+ever taken while user code is running. That is a design choice, not an oversight:
+the kernel is never interrupted in the middle of its own work, so there is no
+reentrancy to reason about and no critical section needing a lock. Kernel fibers
+are the kernel's own code and are expected to cooperate; applications are not.
+
+`apps/spin` proves it — a loop with no syscall in it at all. Between its start and
+the end of its first pass, 14 lines of other processes' output appear, which under
+cooperative scheduling alone could not happen until it finished.
+
+Because time is counted in instructions rather than wall-clock, runs are
+reproducible: two runs produced byte-identical output and the same 458
+preemptions.
+
 ## What to do next
 
 Nothing is blocked. In rough order of value:
 
-1. **Preemption.** Scheduling is cooperative, so a user process that never makes a
-   syscall never gives up the CPU. Nothing generates timer interrupts yet.
-2. **A leaner logging path.** The counter app's text is ~240KB, nearly all Odin
+1. **A leaner logging path.** The counter app's text is ~240KB, nearly all Odin
    runtime pulled in by `fmt`.
-3. **Process supervision**, which is where the mailbox-deadlock question below
+2. **Process supervision**, which is where the mailbox-deadlock question below
    wants to be settled.
-4. **A kernel-side grant window**, if the GUI compositor ends up kernel-resident.
+3. **A kernel-side grant window**, if the GUI compositor ends up kernel-resident.
    Grants are user-to-user today for the reason given above.
+4. **Emulator throughput**, if the ~9 second boot starts to hurt again. The lever
+   left is a TLB in the host: translation is walked fresh on every access, about
+   twice per instruction. Building the apps optimized would help too, once the
+   `app_main` linkage survives it.
 
 ## Hard-won knowledge
 
@@ -342,6 +374,75 @@ Things that cost real debugging time. Do not rediscover them.
   syscall that blocks lets another process trap, which overwrites both. Restore
   them from the frame on the way out, and decide `sscratch` from the `SPP` you just
   restored rather than from the live register.
+
+- **Moving memory is the most expensive thing the kernel does, and the compiler's
+  `memset`/`memcpy` are a trap.** Starting a process cost 29.1M ticks, ~88% of a
+  boot across four processes. It was not the host: the SBI image read copies 1.3MB
+  in 0.22s total. It is the ~1.4MB cleared and ~276KB copied per process.
+
+  The kernel links **the compiler's own `memset` and `memcpy`**, which land in the
+  kernel object and win at link, rather than the ones in `stdlib/memops.S`. Those
+  are now also exported as `memset_asm` and `memcpy_asm`, because the plain names
+  cannot be taken — and the kernel calls the aliases directly from `alloc_frame`
+  and `map_segment`.
+
+  The gap is not a cleverer algorithm, it is `-o:none`. Disassemble `memset` in
+  `os/bin/kernel.elf` and the inner loop is **13 instructions to store one byte**,
+  with the index, the length, the pointer and the fill byte each reloaded from the
+  stack and spilled back on every iteration, and a `j` to the following instruction
+  left in twice. `memcpy` is the same shape at 14 instructions a byte. The assembly
+  stores eight bytes per instruction from a 32-times-unrolled loop: 34 instructions
+  per 256 bytes, or **0.13 a byte** — around 100x on the inner loop.
+
+  Two consequences worth keeping. Multiply it out and 13 instructions a byte over
+  the 1.4MB cleared, 276KB copied and 324KB staged per process predicts 26.6M of
+  the 29.1M ticks that were measured, so these two routines really were nearly all
+  of process creation. And because the assembly does not care how the kernel is
+  built, this fix holds whether or not `-o:speed` is ever turned on.
+
+  Measured over the same boot:
+
+  | clearing and copying with | ticks | wall |
+  |---|---|---|
+  | the compiler's routines | 132.5M | 87s |
+  | an inline `u64` loop | 79.0M | 53s |
+  | `memset_asm` | 34.8M | 24s |
+  | `memset_asm` + `memcpy_asm` | 17.3M | 14s |
+  | the same, kernel built `-o:speed` | **11.3M** | **9s** |
+
+  Handing the clearing to the host over the `SYS_MEMSET` ecall instead was also
+  tried: 34.0M ticks and 25s, level with `memset_asm` and no better, because the
+  host pays per byte in page-table walks what the guest saves. Not worth a
+  non-standard SBI call.
+
+  Watch for this whenever a hot path calls `copy()` or clears a buffer.
+
+- **The kernel is built `-o:speed`; the apps are not, and cannot be yet.** The
+  kernel at `-o:speed` takes a boot from 14s to 9s and 17.3M ticks to 11.3M, with
+  output identical to the unoptimized build apart from interleaving, and still
+  reproducible run to run.
+
+  The apps break at `-o:speed`: `app_main` is `@(export)`ed by the application and
+  declared as a `foreign import` by `sdk/app/start.odin`, and optimization removes
+  the definition, so the link fails with `undefined reference to app_main`. That
+  wants an SDK fix — a `@(require)` or equivalent to hold the symbol — not a flag.
+
+  Note the object layout differs by optimization level: `-o:none` emits one object
+  per package (`kernel-runtime-core.o` and friends), `-o:speed` emits a single
+  `kernel.o`. The Makefile globs `kernel*.o` and `counter*.o` so either works.
+
+  The residual risk is that optimization exposes undefined behaviour in code that
+  casts integers to pointers, switches stacks behind the compiler's back, or writes
+  page tables the hardware reads. Nothing has shown up: the byte-exact check of a
+  16K grant moved between address spaces passes, the frame-pool asserts pass, and
+  faults still land exactly where they are provoked. Watch for it anyway.
+
+- **The emulator walks the page tables on every access.** At the time of measuring
+  there were 267M translation calls for 132M instructions — about two per
+  instruction, each a fresh three-level walk with a map lookup per level. There is
+  no TLB by design (which is why `sfence.vma` has nothing to do). That is the
+  biggest lever left on the host side if ~1.5M instructions a second stops being
+  enough.
 
 - **`C.ADDW` was missing from the compressed decoder**, which surfaced as
   `VM halted: Invalid` the first time an app did 32-bit addition in a hot loop.
@@ -408,6 +509,12 @@ Things that cost real debugging time. Do not rediscover them.
   of corrupting. Sharing can be added later as a second mode, once a compositor
   exists to say what it actually needs.
 - **App ELF bytes come from an SBI hypercall**, not an embedded archive.
+- **Time is counted in instructions, not wall-clock**, and the timer is an SBI call
+  rather than a memory-mapped CLINT. Cheaper to build, and it makes a run
+  reproducible: the same program is preempted in the same places every time,
+  whatever the host is doing.
+- **Only user code is preempted.** The kernel keeps `sstatus.SIE` clear, so it is
+  never interrupted mid-operation and needs no locks or reentrancy.
 - **A user process is hosted by a kernel fiber**, rather than the kernel keeping a
   saved trap frame per process and re-entering user mode from the scheduler. It
   costs one 16K kernel stack per process and buys blocking syscalls for free,
@@ -426,9 +533,14 @@ Things that cost real debugging time. Do not rediscover them.
 - **Bounded mailboxes plus blocking retry loops can deadlock** if two processes
   fill each other's mailboxes. Inherent to reject-newest; normally handled with
   timeouts or supervision. Worth settling when process supervision is designed.
-- **Scheduling is round-robin and cooperative.** A user process that never makes a
-  syscall never gives up the CPU, because nothing generates timer interrupts yet.
-  Preemption is the fix and is untouched.
+- **Scheduling is round-robin, and preemptive only for user code.** A kernel task
+  that spins still stops the machine. That is deliberate — see the preemption notes
+  above — but it means a buggy in-kernel driver is a hang, not a slow process.
+- **Almost none of the machine's time goes to application code.** Loading one
+  process was measured at 29.1M ticks; four loads were 88% of a whole boot. Fixing
+  which memset and memcpy the kernel calls, and building it optimized, took a boot
+  from 87s to 9s. What remains is still mostly process creation rather than
+  application work.
 - **The frame pool never returns memory to the heap**, and its bump pointer never
   walks back, so the pool's high-water mark is permanent. Fine while frames are
   reused; it would matter if something allocated frames in bursts.
