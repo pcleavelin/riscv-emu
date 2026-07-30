@@ -50,13 +50,34 @@ foreign vm_asm {
     csr_read_satp :: proc() -> u64 ---
 }
 
-// Allocate a zeroed, page-aligned table. Alignment is not optional: satp and the
-// non-leaf entries store a frame number, so the low 12 bits must be zero.
+// The first address of the page that holds `addr`, and the first address of the
+// page after it.
+page_base :: proc(addr: u64) -> u64 {
+    return addr &~ u64(PAGE_SIZE - 1)
+}
+
+page_up :: proc(addr: u64) -> u64 {
+    return page_base(addr + PAGE_SIZE - 1)
+}
+
+// Allocate one zeroed, page-aligned frame. Alignment is not optional: satp and
+// the page table entries store a frame number, so the low 12 bits must be zero.
+alloc_frame :: proc() -> []u8 {
+    frame, err := mem.alloc_bytes(PAGE_SIZE, PAGE_SIZE, EMU_ALLOCATOR)
+    assert(err == nil, "out of memory allocating a frame")
+    assert(uintptr(raw_data(frame)) & (PAGE_SIZE - 1) == 0, "frame is not page-aligned")
+    return frame
+}
+
+// The physical address of a frame. The kernel is identity mapped, so a frame's
+// own address is also what a page table entry must name.
+frame_paddr :: proc(frame: []u8) -> u64 {
+    return u64(uintptr(raw_data(frame)))
+}
+
+// A page table is one frame read as 512 entries.
 alloc_page_table :: proc() -> ^PageTable {
-    ptr, err := mem.alloc(size_of(PageTable), PAGE_SIZE, EMU_ALLOCATOR)
-    assert(err == nil, "out of memory allocating a page table")
-    assert(uintptr(ptr) & (PAGE_SIZE - 1) == 0, "page table is not page-aligned")
-    return cast(^PageTable)ptr
+    return cast(^PageTable)raw_data(alloc_frame())
 }
 
 // Build a leaf entry pointing at a physical address.
@@ -97,6 +118,28 @@ map_page :: proc(root: ^PageTable, vaddr: u64, paddr: u64, flags: u64) {
     }
 
     table[(vaddr >> 12) & 0x1FF] = leaf_pte(paddr, flags)
+}
+
+// Find the leaf entry that maps `vaddr`, or report that nothing does. A leaf can
+// turn up above the bottom level as a superpage, which is why this descends
+// looking for permission bits rather than simply indexing three times.
+//
+// Table pointers are physical addresses, so this is only correct while the kernel
+// is identity mapped.
+walk :: proc(root: ^PageTable, vaddr: u64) -> (pte: u64, ok: bool) {
+    table := root
+
+    for level := 2; level >= 0; level -= 1 {
+        entry := table[(vaddr >> uint(12 + 9*level)) & 0x1FF]
+        if (entry & PTE_V) == 0 do return 0, false
+
+        // Permission bits are what distinguishes a leaf from a table pointer.
+        if entry & (PTE_R | PTE_W | PTE_X) != 0 do return entry, true
+
+        table = cast(^PageTable)uintptr((entry >> 10) << 12)
+    }
+
+    return 0, false
 }
 
 // Turn on paging with an identity map: every virtual address is its own physical
