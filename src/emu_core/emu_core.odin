@@ -128,6 +128,11 @@ Emu64 :: struct {
     fault_pending: bool,
     fault_cause:   u64,
     fault_addr:    u64,
+
+    // Application images the guest kernel has asked for, keyed by image name.
+    // Serving them from here rather than re-reading the file keeps the size a
+    // read sees identical to the size already reported.
+    image_cache: map[string][]u8,
 }
 
 HostFn :: proc(emu: ^Emu64, user_data: rawptr) -> (ok: bool)
@@ -296,6 +301,7 @@ emu_make :: proc(max_memory: int) -> Emu64 {
         page_table = emu_make_page_table(PAGE_SIZE),
         host_functions = make(map[string]HostFunction),
         csr = make(map[u16]u64),
+        image_cache = make(map[string][]u8),
         mode = .Supervisor,
     }
 
@@ -309,6 +315,7 @@ emu_reset :: proc(e: ^Emu64, max_memory: int) {
     delete(e.page_table.pages)
     delete(e.host_functions)
     delete(e.csr)
+    delete(e.image_cache)
     delete(e.page_arena.data)
 
     e^ = emu_make(max_memory)
@@ -321,6 +328,45 @@ emu_make_page_table :: proc(page_size: u64, allocator := context.allocator) -> E
         page_size = page_size,
         pages = make(map[u64]EmuMemoryPage, allocator),
     }
+}
+
+// Where the SBI image calls look for application images. An image is named, not
+// pathed: `counter` resolves to apps/bin/counter.elf.
+IMAGE_DIR :: "apps/bin"
+
+// Serve an application image to the guest kernel, which has no filesystem of its
+// own. The name must be a bare image name so a guest cannot reach anything
+// outside IMAGE_DIR. Bytes stay cached for the life of the machine.
+emu_image_bytes :: proc(e: ^Emu64, name: string) -> (image: []u8, ok: bool) {
+    if cached, hit := e.image_cache[name]; hit {
+        return cached, true
+    }
+
+    if len(name) == 0 || strings.contains_any(name, "/\\.") {
+        fmt.eprintf("\nSBI image name is not a bare image name: '%v'\n\n", name)
+        return nil, false
+    }
+
+    path := fmt.tprintf("%v/%v.elf", IMAGE_DIR, name)
+    content, read_error := os.read_entire_file_from_path(path, context.allocator)
+    if read_error != nil {
+        fmt.eprintf("\nSBI cannot read image %v\n\n", path)
+        return nil, false
+    }
+
+    // The name came out of guest memory into temporary storage, so the cache
+    // needs its own copy to key on.
+    e.image_cache[strings.clone(name)] = content
+    return content, true
+}
+
+// Read a string out of guest memory, through the guest's own translation.
+emu_read_string :: proc(e: ^Emu64, addr: u64, length: u64) -> string {
+    buf := make([]u8, length, allocator = context.temp_allocator)
+    for i in 0..<length {
+        buf[i] = emu_read_u8(e, addr+i)
+    }
+    return string(buf)
 }
 
 emu_load_elf :: proc(e: ^Emu64, file_path: string) -> (start_addr: u64, ok: bool) {
@@ -2509,6 +2555,11 @@ eval_ecall :: proc(e: ^Emu64, di: Instr) -> (pc_offset: u64, cont: bool) {
 
     SYS_LINUX_WRITE      :: 0x40
 
+    // Application images, for the guest kernel's loader. The kernel asks for a
+    // size, allocates a staging buffer, then asks for the bytes.
+    SBI_IMAGE_SIZE       :: 0x20 // (name_ptr, name_len) -> size, 0 if unknown
+    SBI_IMAGE_READ       :: 0x21 // (name_ptr, name_len, dest) -> bytes written
+
     sys_call_id := emu_read_reg(e, 17)
 
     switch sys_call_id {
@@ -2538,6 +2589,32 @@ eval_ecall :: proc(e: ^Emu64, di: Instr) -> (pc_offset: u64, cont: bool) {
 
             emu_write_reg(e, 10, count)
         }
+        case SBI_IMAGE_SIZE: {
+            name := emu_read_string(e, emu_read_reg(e, 10), emu_read_reg(e, 11))
+
+            image, ok := emu_image_bytes(e, name)
+            if !ok {
+                emu_write_reg(e, 10, 0)
+                break
+            }
+
+            emu_write_reg(e, 10, u64(len(image)))
+        }
+        case SBI_IMAGE_READ: {
+            name := emu_read_string(e, emu_read_reg(e, 10), emu_read_reg(e, 11))
+            dest := emu_read_reg(e, 12)
+
+            image, ok := emu_image_bytes(e, name)
+            if !ok {
+                emu_write_reg(e, 10, 0)
+                break
+            }
+
+            // dest is a supervisor virtual address, so this writes through the
+            // guest's page tables and lands wherever the kernel staged it.
+            emu_copy_into_mem(e, image, dest)
+            emu_write_reg(e, 10, u64(len(image)))
+        }
         case SYS_MEMSET: {
             addr := emu_read_reg(e, 10)
             value := emu_read_reg(e, 11)
@@ -2564,15 +2641,7 @@ eval_ecall :: proc(e: ^Emu64, di: Instr) -> (pc_offset: u64, cont: bool) {
             func_name_addr := emu_read_reg(e, 10)
             func_name_len := emu_read_reg(e, 11)
 
-            read_emu_string :: proc(e: ^Emu64, addr: u64, len: u64) -> string {
-                buf := make([]u8, len, allocator = context.temp_allocator)
-                for i in 0..<len {
-                    buf[i] = emu_read_u8(e, addr+i)
-                }
-                return string(buf)
-            }
-
-            func_name := read_emu_string(e, func_name_addr, func_name_len)
+            func_name := emu_read_string(e, func_name_addr, func_name_len)
 
             if f, ok := e.host_functions[func_name]; ok {
                 if ok := f.fn(e, f.user_data); !ok {
@@ -2583,7 +2652,7 @@ eval_ecall :: proc(e: ^Emu64, di: Instr) -> (pc_offset: u64, cont: bool) {
                 str_addr := emu_comm_stack_pop_u64(e) or_break
                 str_len := emu_comm_stack_pop_u32(e) or_break
 
-                str := read_emu_string(e, str_addr, u64(str_len))
+                str := emu_read_string(e, str_addr, u64(str_len))
                 fmt.eprintf("%v", str)
             } else if func_name == "core::readln" {
                 buf := "test input"

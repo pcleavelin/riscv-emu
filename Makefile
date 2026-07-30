@@ -7,7 +7,8 @@ emu_os:
 	odin build os -define:EMU_DEFAULT_START=false -target:freestanding_riscv64 -build-mode:object -default-to-nil-allocator -no-thread-local -no-rpath -no-crt -o:none -out:os/bin/kernel.o
 	riscv64-none-elf-gcc -c os/switch.S -ffreestanding -o os/bin/switch.o
 	riscv64-none-elf-gcc -c os/trap.S -ffreestanding -o os/bin/trap.o
-	riscv64-none-elf-ld -T os/kernel.ld os/bin/kernel-* os/bin/switch.o os/bin/trap.o --just-symbols bin/stdlib.elf -o os/bin/kernel.elf
+	riscv64-none-elf-gcc -c os/sbi.S -ffreestanding -o os/bin/sbi.o
+	riscv64-none-elf-ld -T os/kernel.ld os/bin/kernel-* os/bin/switch.o os/bin/trap.o os/bin/sbi.o --just-symbols bin/stdlib.elf -o os/bin/kernel.elf
 
 emu_apps:
 	mkdir -p apps/bin
