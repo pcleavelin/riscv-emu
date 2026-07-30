@@ -17,7 +17,14 @@ import "../../sdk/app"
 PASSES :: 3
 WORK :: 8_000
 
-@(export)
+// The ELF entry, which every app carries. The SDK cannot name the app's entry
+// itself without declaring it foreign, and that does not survive an optimized
+// build -- see sdk/app/start.odin.
+@(link_name = "_start", linkage = "strong", require)
+_start :: proc "c" () {
+    app.start(app_main)
+}
+
 app_main :: proc() {
     app.log("spin: working, and yielding to nobody\n")
 

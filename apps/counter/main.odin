@@ -22,7 +22,14 @@ Counter :: struct {
 // says the loader copied the file-backed part of the image correctly.
 state := Counter{limit = 5}
 
-@(export)
+// The ELF entry, which every app carries. The SDK cannot name the app's entry
+// itself without declaring it foreign, and that does not survive an optimized
+// build -- see sdk/app/start.odin.
+@(link_name = "_start", linkage = "strong", require)
+_start :: proc "c" () {
+    app.start(app_main)
+}
+
 app_main :: proc() {
     app.log("counter(user): ready\n")
 
