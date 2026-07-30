@@ -56,6 +56,15 @@ SSTATUS_SPIE :: u64(1) << 5 // interrupt-enable state saved on trap entry
 SSTATUS_SPP  :: u64(1) << 8  // privilege level the trap came from (1 = S, 0 = U)
 SSTATUS_SUM  :: u64(1) << 18 // permit supervisor loads and stores to user pages
 
+// An interrupt is distinguished from an exception by the top bit of scause; the
+// rest of the value says which interrupt.
+CAUSE_INTERRUPT :: u64(1) << 63
+IRQ_S_TIMER     :: u64(5)
+
+// The timer's bit in sie and sip, at the interrupt number's position.
+SIE_STIE :: u64(1) << 5
+SIP_STIP :: u64(1) << 5
+
 // scause values for the traps the emulator raises.
 CAUSE_ECALL_FROM_U   :: u64(8)
 CAUSE_ILLEGAL_INSTR  :: u64(2)
@@ -128,6 +137,14 @@ Emu64 :: struct {
     fault_pending: bool,
     fault_cause:   u64,
     fault_addr:    u64,
+
+    // The machine's whole notion of time: one tick per instruction retired. The
+    // guest asks to be interrupted at a deadline and the timer fires when the
+    // count reaches it, which makes preemption reproducible -- the same program
+    // is preempted in the same places on every run, however fast the host is.
+    ticks:          u64,
+    timer_deadline: u64,
+    timer_armed:    bool,
 
     // Application images the guest kernel has asked for, keyed by image name.
     // Serving them from here rather than re-reading the file keeps the size a
@@ -2289,7 +2306,12 @@ emu_eval_instr :: proc(e: ^Emu64, di: Instr) -> (pc_offset: u64, cont: bool) {
             return 0, true
         }
         case .WFI: {
-            // Nothing generates interrupts yet, so waiting would hang forever.
+            // Wait for the next interrupt. Time is counted per instruction, so an
+            // idle guest would otherwise spin the host to reach its own deadline;
+            // moving the clock straight to it costs nothing and means the same.
+            if e.timer_armed && e.ticks < e.timer_deadline {
+                e.ticks = e.timer_deadline
+            }
             return u64(di.length), true
         }
         case .SFENCE_VMA: {
@@ -2575,6 +2597,10 @@ eval_ecall :: proc(e: ^Emu64, di: Instr) -> (pc_offset: u64, cont: bool) {
     SBI_IMAGE_SIZE       :: 0x20 // (name_ptr, name_len) -> size, 0 if unknown
     SBI_IMAGE_READ       :: 0x21 // (name_ptr, name_len, dest) -> bytes written
 
+    // The timer the kernel preempts with.
+    SBI_TIME             :: 0x30 // -> ticks since the machine started
+    SBI_SET_TIMER        :: 0x31 // (deadline) -> arms it, and clears the old one
+
     sys_call_id := emu_read_reg(e, 17)
 
     switch sys_call_id {
@@ -2603,6 +2629,16 @@ eval_ecall :: proc(e: ^Emu64, di: Instr) -> (pc_offset: u64, cont: bool) {
             fmt.eprintf("\nSYS_LINUX_WRITE: %v\n\n", str)
 
             emu_write_reg(e, 10, count)
+        }
+        case SBI_TIME: {
+            emu_write_reg(e, 10, e.ticks)
+        }
+        case SBI_SET_TIMER: {
+            // Arming the timer is also how the guest acknowledges the last one:
+            // the pending bit would otherwise re-enter the handler forever.
+            emu_write_csr(e, CSR_SIP, emu_read_csr(e, CSR_SIP) &~ SIP_STIP)
+            e.timer_deadline = emu_read_reg(e, 10)
+            e.timer_armed = true
         }
         case SBI_IMAGE_SIZE: {
             name := emu_read_string(e, emu_read_reg(e, 10), emu_read_reg(e, 11))
@@ -2747,6 +2783,16 @@ eval_ecall :: proc(e: ^Emu64, di: Instr) -> (pc_offset: u64, cont: bool) {
 emu_step :: proc(e: ^Emu64) -> StopReason {
     if e.pc == EMU_HALT_VECTOR do return .Halt
 
+    e.ticks += 1
+    if e.timer_armed && e.ticks >= e.timer_deadline {
+        e.timer_armed = false
+        emu_write_csr(e, CSR_SIP, emu_read_csr(e, CSR_SIP) | SIP_STIP)
+    }
+
+    // An interrupt is taken between instructions, so the one about to run has not
+    // run yet and is exactly where the handler should resume.
+    if emu_take_interrupt(e) do return .None
+
     e.stop_reason = .Invalid
     e.fault_pending = false
 
@@ -2771,6 +2817,31 @@ emu_step :: proc(e: ^Emu64) -> StopReason {
 
     if cont do return .None
     return e.stop_reason
+}
+
+// Take a pending, enabled interrupt if the current privilege level permits it.
+//
+// An interrupt bound for supervisor mode is always taken while user code runs,
+// because supervisor outranks user. In supervisor mode it is taken only while
+// sstatus.SIE is set -- so a kernel that leaves SIE clear is never interrupted in
+// the middle of its own work, and only user code gets preempted.
+@(private)
+emu_take_interrupt :: proc(e: ^Emu64) -> bool {
+    if e.mode == .Machine do return false
+
+    pending := emu_read_csr(e, CSR_SIP) & emu_read_csr(e, CSR_SIE)
+    if pending == 0 do return false
+
+    if e.mode == .Supervisor && (emu_read_csr(e, CSR_SSTATUS) & SSTATUS_SIE) == 0 {
+        return false
+    }
+
+    if (pending & SIP_STIP) != 0 {
+        emu_trap_to_supervisor(e, CAUSE_INTERRUPT | IRQ_S_TIMER, 0, e.pc)
+        return true
+    }
+
+    return false
 }
 
 @(private)

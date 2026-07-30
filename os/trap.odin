@@ -61,6 +61,7 @@ foreign trap_asm {
     csr_read_scause :: proc() -> u64 ---
     csr_read_stval :: proc() -> u64 ---
     csr_write_stvec :: proc(value: u64) ---
+    csr_set_sie :: proc(mask: u64) ---
 
     // Open and close the window in which the kernel may touch user memory.
     user_access_begin :: proc() ---
@@ -79,6 +80,29 @@ trap_handler :: proc "c" (frame: ^TrapFrame) {
     context = EMU_CONTEXT
 
     cause := csr_read_scause()
+
+    // An interrupt rather than something the running code did wrong.
+    if (cause & CAUSE_INTERRUPT) != 0 {
+        if (cause &~ CAUSE_INTERRUPT) == IRQ_S_TIMER {
+            timer_rearm()
+
+            // The kernel runs with interrupts off, so this can only have come
+            // from user mode -- but say so, because what follows takes the CPU
+            // away from whoever is running and that must be a user process.
+            if (frame.sstatus & SSTATUS_SPP) == 0 && current_process != nil {
+                preemptions += 1
+
+                // Stay runnable and hand the CPU to the scheduler. The frame
+                // sitting on this process's kernel stack is what brings it back
+                // exactly where the interrupt found it.
+                yield(current_process)
+            }
+            return
+        }
+
+        kprint("kernel: unexpected interrupt %d\n", cause &~ CAUSE_INTERRUPT)
+        return
+    }
 
     if cause == CAUSE_ECALL_FROM_U {
         p := current_process

@@ -10,11 +10,26 @@ package kernel
 SBI_IMAGE_SIZE :: 0x20 // (name_ptr, name_len) -> size in bytes, 0 if unknown
 SBI_IMAGE_READ :: 0x21 // (name_ptr, name_len, dest) -> bytes written
 
+SBI_TIME :: 0x30      // -> ticks since the machine started
+SBI_SET_TIMER :: 0x31 // (deadline) -> arms it, and clears the old one
+
 foreign import sbi_asm "system:sbi_asm"
 
 @(default_calling_convention = "c")
 foreign sbi_asm {
     sbi_call :: proc(number, arg0, arg1, arg2: u64) -> u64 ---
+}
+
+// The machine's clock, counted in instructions retired rather than seconds. Only
+// the difference between two readings means anything.
+sbi_time :: proc() -> u64 {
+    return sbi_call(SBI_TIME, 0, 0, 0)
+}
+
+// Ask to be interrupted once the clock reaches `deadline`, and acknowledge any
+// timer interrupt already pending.
+sbi_set_timer :: proc(deadline: u64) {
+    sbi_call(SBI_SET_TIMER, deadline, 0, 0)
 }
 
 // The size of the image named `name`, or zero when the host has no such image.

@@ -35,4 +35,10 @@ boot :: proc(k: ^Kernel) {
     }
 
     post_value(k, painter, "paint", display)
+
+    // A process that never yields. Everything above shares the CPU because it
+    // asks to; this one does not ask, and the timer takes it back anyway.
+    if _, ok := spawn_user(k, "spin"); !ok {
+        kprint("boot: cannot start the spin app\n")
+    }
 }

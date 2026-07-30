@@ -188,6 +188,12 @@ csr_read_scause:
     csrr a0, scause
     ret
 
+/* Enable the interrupts named by the mask, leaving the others as they are. */
+.globl csr_set_sie
+csr_set_sie:
+    csrs sie, a0
+    ret
+
 .globl csr_read_stval
 csr_read_stval:
     csrr a0, stval

@@ -48,6 +48,7 @@ _start :: proc() {
     frame_pool_check()
 
     kernel_root = paging_init()
+    timer_init() // nothing runs in user mode before this, so nothing goes unpreempted
     kprint("kernel: paging on, satp=%x\n", csr_read_satp())
 
     k: Kernel
@@ -60,6 +61,7 @@ _start :: proc() {
         }
     }
     frame_pool_report()
+    kprint("kernel: %d ticks, preempted a process %d times\n", sbi_time(), preemptions)
     kprint("kernel: idle, shutting down\n")
 }
 
