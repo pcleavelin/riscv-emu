@@ -212,6 +212,21 @@ run_service :: proc(handler: proc(msg: Message)) -> ! {
     }
 }
 
+// --- The display ---------------------------------------------------------------
+
+// How big a frame is, in pixels. A frame is that many RGBA bytes, row by row from
+// the top, and belongs in a grant.
+display_size :: proc() -> (width: int, height: int) {
+    packed := u64(do_syscall(abi.SYS_DISPLAY_INFO, 0, 0))
+    return int(packed >> 32), int(packed & 0xFFFF_FFFF)
+}
+
+// Show a frame. The grant stays ours -- unlike sending one, presenting only reads
+// it, so the next frame can be drawn into the same buffer.
+present :: proc(g: Grant) -> bool {
+    return do_syscall(abi.SYS_PRESENT, u64(g.id), 0) == abi.OK
+}
+
 // --- Diagnostics ---------------------------------------------------------------
 
 log :: proc(msg: string) {

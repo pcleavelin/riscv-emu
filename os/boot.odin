@@ -36,6 +36,11 @@ boot :: proc(k: ^Kernel) {
 
     post_value(k, painter, "paint", display)
 
+    // Something to look at: it draws frames and asks for them to be shown.
+    if _, ok := spawn_user(k, "gfx"); !ok {
+        kprint("boot: cannot start the gfx app\n")
+    }
+
     // A process that never yields. Everything above shares the CPU because it
     // asks to; this one does not ask, and the timer takes it back anyway.
     if _, ok := spawn_user(k, "spin"); !ok {

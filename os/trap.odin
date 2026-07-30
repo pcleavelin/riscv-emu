@@ -226,6 +226,12 @@ user_syscall :: proc(p: ^Process, number, arg0, arg1: u64) -> i64 {
     case abi.SYS_GRANT_DROP:
         return grant_drop(p, GrantId(i64(arg0)))
 
+    case abi.SYS_PRESENT:
+        return grant_show(p, GrantId(i64(arg0)))
+
+    case abi.SYS_DISPLAY_INFO:
+        return i64(sbi_display_info())
+
     case abi.SYS_SPAWN:
         name: [IMAGE_NAME_MAX]u8
         length := min(arg1, u64(IMAGE_NAME_MAX))

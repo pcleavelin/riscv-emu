@@ -40,6 +40,8 @@ SYS_SELF :: 8
 SYS_GRANT_CREATE :: 9
 SYS_GRANT_MAP :: 10
 SYS_GRANT_DROP :: 11
+SYS_PRESENT :: 12      // show a grant's contents on the display
+SYS_DISPLAY_INFO :: 13 // -> width in the high 32 bits, height in the low
 
 OK :: 0
 ERR_FAULT :: -1    // a pointer argument was not usable by this process

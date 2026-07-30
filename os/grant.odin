@@ -203,6 +203,30 @@ grant_drop :: proc(p: ^Process, id: GrantId) -> i64 {
     return abi.OK
 }
 
+// Show a grant on the display. The frames behind it are not contiguous, so they go
+// across a page at a time, and nothing appears until the whole frame has arrived.
+//
+// The kernel reads the frames by physical address, which it can do because it is
+// identity mapped -- so this needs no window into the process's address space and
+// works whether or not the process still has the grant mapped.
+grant_show :: proc(p: ^Process, id: GrantId) -> i64 {
+    g := grant_owned_by(id, p)
+    if g == nil do return abi.ERR_NO_GRANT
+
+    remaining := g.size
+    offset := u64(0)
+    for i in 0 ..< g.page_count {
+        length := min(remaining, u64(PAGE_SIZE))
+        sbi_display_blit(g.pages[i], offset, length)
+
+        offset += length
+        remaining -= length
+    }
+
+    sbi_display_show()
+    return abi.OK
+}
+
 // Release every grant a dying process owns, including any still in transit to it.
 //
 // This must run before its address space is freed. A mapped grant's frames are

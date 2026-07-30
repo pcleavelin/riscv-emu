@@ -146,6 +146,9 @@ Emu64 :: struct {
     timer_deadline: u64,
     timer_armed:    bool,
 
+    // The framebuffer, and how it reaches a screen.
+    display: Display,
+
     // Application images the guest kernel has asked for, keyed by image name.
     // Serving them from here rather than re-reading the file keeps the size a
     // read sees identical to the size already reported.
@@ -320,6 +323,12 @@ emu_make :: proc(max_memory: int) -> Emu64 {
         csr = make(map[u16]u64),
         image_cache = make(map[string][]u8),
         mode = .Supervisor,
+    }
+
+    e.display = Display {
+        width  = DISPLAY_WIDTH,
+        height = DISPLAY_HEIGHT,
+        pixels = make([]u8, DISPLAY_WIDTH*DISPLAY_HEIGHT*DISPLAY_BYTES_PER_PIXEL),
     }
 
     backing := make([]u8, max_memory)
@@ -677,6 +686,25 @@ emu_get_page :: proc(e: ^Emu64, paddr: u64) -> ^EmuMemoryPage {
     }
 
     return page
+}
+
+// --- The display -----------------------------------------------------------------
+//
+// A framebuffer the guest draws into and asks to have shown. The emulator owns the
+// pixels and knows nothing about how they reach a screen: the front end installs a
+// `show` procedure, so the same machine renders into a terminal over ssh or into a
+// window, and the guest cannot tell which.
+//
+// Pixels are RGBA, one byte each, row by row from the top.
+
+DISPLAY_WIDTH :: 64
+DISPLAY_HEIGHT :: 64
+DISPLAY_BYTES_PER_PIXEL :: 4
+
+Display :: struct {
+    width, height: int,
+    pixels:        []u8,
+    show:          proc(width, height: int, pixels: []u8),
 }
 
 EmuValue :: union {
@@ -2601,6 +2629,12 @@ eval_ecall :: proc(e: ^Emu64, di: Instr) -> (pc_offset: u64, cont: bool) {
     SBI_TIME             :: 0x30 // -> ticks since the machine started
     SBI_SET_TIMER        :: 0x31 // (deadline) -> arms it, and clears the old one
 
+    // The display. Pixels arrive a block at a time, because the frames behind a
+    // grant are not contiguous, and are shown only when the guest says so.
+    SBI_DISPLAY_INFO     :: 0x50 // -> width in the high 32 bits, height in the low
+    SBI_DISPLAY_BLIT     :: 0x51 // (paddr, offset, len) -> bytes taken
+    SBI_DISPLAY_SHOW     :: 0x52 // -> shows what has been blitted
+
     sys_call_id := emu_read_reg(e, 17)
 
     switch sys_call_id {
@@ -2639,6 +2673,33 @@ eval_ecall :: proc(e: ^Emu64, di: Instr) -> (pc_offset: u64, cont: bool) {
             emu_write_csr(e, CSR_SIP, emu_read_csr(e, CSR_SIP) &~ SIP_STIP)
             e.timer_deadline = emu_read_reg(e, 10)
             e.timer_armed = true
+        }
+        case SBI_DISPLAY_INFO: {
+            emu_write_reg(e, 10, (u64(e.display.width) << 32) | u64(e.display.height))
+        }
+        case SBI_DISPLAY_BLIT: {
+            paddr := emu_read_reg(e, 10)
+            offset := emu_read_reg(e, 11)
+            length := emu_read_reg(e, 12)
+
+            // Clamp rather than trust: the guest names a physical address and a
+            // length, and neither has to fit the framebuffer.
+            if offset >= u64(len(e.display.pixels)) {
+                emu_write_reg(e, 10, 0)
+                break
+            }
+            length = min(length, u64(len(e.display.pixels)) - offset)
+
+            for i in 0 ..< length {
+                e.display.pixels[offset + i] = phys_read_u8(e, paddr + i)
+            }
+
+            emu_write_reg(e, 10, length)
+        }
+        case SBI_DISPLAY_SHOW: {
+            if e.display.show != nil {
+                e.display.show(e.display.width, e.display.height, e.display.pixels)
+            }
         }
         case SBI_IMAGE_SIZE: {
             name := emu_read_string(e, emu_read_reg(e, 10), emu_read_reg(e, 11))

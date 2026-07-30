@@ -15,6 +15,10 @@ SBI_IMAGE_READ :: 0x21 // (name_ptr, name_len, dest) -> bytes written
 SBI_TIME :: 0x30      // -> ticks since the machine started
 SBI_SET_TIMER :: 0x31 // (deadline) -> arms it, and clears the old one
 
+SBI_DISPLAY_INFO :: 0x50 // -> width in the high 32 bits, height in the low
+SBI_DISPLAY_BLIT :: 0x51 // (paddr, offset, len) -> bytes taken
+SBI_DISPLAY_SHOW :: 0x52 // -> shows what has been blitted
+
 foreign import sbi_asm "system:sbi_asm"
 
 @(default_calling_convention = "c")
@@ -32,6 +36,23 @@ sbi_time :: proc() -> u64 {
 // timer interrupt already pending.
 sbi_set_timer :: proc(deadline: u64) {
     sbi_call(SBI_SET_TIMER, deadline, 0, 0)
+}
+
+// The framebuffer's size, packed as width in the high half and height in the low.
+sbi_display_info :: proc() -> u64 {
+    return sbi_call(SBI_DISPLAY_INFO, 0, 0, 0)
+}
+
+// Put a block of physical memory into the framebuffer at `offset`. A frame arrives
+// in pieces because the memory behind it need not be contiguous.
+sbi_display_blit :: proc(paddr: u64, offset: u64, length: u64) -> u64 {
+    return sbi_call(SBI_DISPLAY_BLIT, paddr, offset, length)
+}
+
+// Show what has been blitted. Nothing appears until this is called, so a frame is
+// never seen half-drawn.
+sbi_display_show :: proc() {
+    sbi_call(SBI_DISPLAY_SHOW, 0, 0, 0)
 }
 
 // The size of the image named `name`, or zero when the host has no such image.
