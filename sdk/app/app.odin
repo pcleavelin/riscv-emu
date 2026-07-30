@@ -81,6 +81,12 @@ send_grant :: proc(to: ProcessId, tag: string, g: Grant, data: []u8 = nil) -> bo
     return send_full(to, tag, data, g.id)
 }
 
+// Send a grant with a plain-old-data value alongside it. Pair with message_value.
+send_grant_value :: proc(to: ProcessId, tag: string, g: Grant, value: $T) -> bool {
+    v := value
+    return send_grant(to, tag, g, slice.bytes_from_ptr(&v, size_of(T)))
+}
+
 @(private)
 send_full :: proc(to: ProcessId, tag: string, data: []u8, grant: GrantId) -> bool {
     assert(len(tag) <= abi.TAG_MAX, "message tag too long")

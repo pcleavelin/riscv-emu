@@ -24,9 +24,9 @@ boot :: proc(k: ^Kernel) {
 
     post_value(k, spawn_task(k, ticker_task), "config", user_counter)
 
-    // Two processes from one image, to hand a frame of pixels from one to the
-    // other. A message carries 64 bytes; the frame is 16K, so it travels as a
-    // grant -- the memory moves, and nothing copies it.
+    // Two processes from one image, passing a frame of pixels back and forth. A
+    // message carries 64 bytes; the frame is 16K, so it travels as a grant -- the
+    // memory moves, and nothing copies it.
     painter, painter_ok := spawn_user(k, "pixels")
     display, display_ok := spawn_user(k, "pixels")
     if !painter_ok || !display_ok {

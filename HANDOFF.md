@@ -299,10 +299,16 @@ being `kernel_root`. The 346 reclaimed are exactly what the user process owned: 
 for the image, 256 for its 1MB heap, 16 for its 64K stack, and 5 page tables.
 
 **Grants work.** `apps/pixels` is one image started twice: one process paints a
-64×64×4 frame (16K, so 256× the inline message limit) into a grant and sends it,
-the other maps it and checks every pixel. The painter *exits before* the display
-reads the buffer and all 4096 pixels are still correct, which is the proof that
-the memory moved rather than being copied out of a still-live address space.
+64×64×4 frame (16K, so 256× the inline message limit) into a grant and hands it
+over, the other maps it, checks every pixel, and hands the buffer back so the
+painter can draw the next frame into it. Three frames go round.
+
+That round trip is not incidental — it *is* what transfer semantics cost. Because
+a grant belongs to exactly one process, a client redrawing the same buffer has to
+be given it back first, so the frame loop is paint → hand over → verify → hand
+back. Each frame's pattern is shifted by its frame number and checked against the
+number the message carried, so a buffer that was not really re-transferred would
+show up as a whole frame behind rather than as plausible-looking pixels.
 
 Verified by temporarily writing to the buffer after the handover: the painter took
 `cause=15 stval=30000000` and was killed alone, the display still got the frame
@@ -336,6 +342,14 @@ Things that cost real debugging time. Do not rediscover them.
   syscall that blocks lets another process trap, which overwrites both. Restore
   them from the frame on the way out, and decide `sscratch` from the `SPP` you just
   restored rather than from the live register.
+
+- **`C.ADDW` was missing from the compressed decoder**, which surfaced as
+  `VM halted: Invalid` the first time an app did 32-bit addition in a hot loop.
+  The CA-format group is complete now (`C.SUB`/`C.XOR`/`C.OR`/`C.AND` and
+  `C.SUBW`/`C.ADDW`), but if the guest ever dies as `Invalid` again, suspect a
+  missing instruction before suspecting the guest. `emu_run` now prints the pc and
+  privilege on an undecodable instruction; `riscv64-none-elf-objdump -d` on the
+  image tells you which one and in whose function.
 
 - **The SYSTEM opcode `0b1110011` originally decoded to `ECALL` unconditionally**,
   so every `csrrw`, `sret` and `ebreak` was silently a syscall. Fixed in
@@ -404,10 +418,11 @@ Things that cost real debugging time. Do not rediscover them.
 
 ## Open questions
 
-- **Grants are one-shot handovers, not shared buffers.** A client that redraws the
-  same buffer every frame has to be re-granted it each time, which costs a round
-  trip. Whether that matters is a question for a real compositor; adding a shared
-  mode later means adding a synchronization story the kernel does not have.
+- **Grants are one-shot handovers, not shared buffers.** `apps/pixels` shows what
+  that costs: a client redrawing the same buffer must be handed it back each time,
+  so every frame is a round trip of two messages rather than one. Whether that
+  matters is a question for a real compositor — a shared mode would remove the
+  return leg but needs a synchronization story the kernel does not have.
 - **Bounded mailboxes plus blocking retry loops can deadlock** if two processes
   fill each other's mailboxes. Inherent to reject-newest; normally handled with
   timeouts or supervision. Worth settling when process supervision is designed.
