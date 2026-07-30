@@ -32,6 +32,11 @@ count_service :: proc(p: ^Process, msg: Message) {
     case "get":
         send_value(p, msg.from, "value", c.count)
 
+    case "quit":
+        // A service has no loop to leave, so being released just means going
+        // quiet: nothing sends to it again and it stays Waiting.
+        kprint("  counter: released at %d\n", c.count)
+
     case:
         kprint("  counter: ignoring %s\n", msg.tag)
     }

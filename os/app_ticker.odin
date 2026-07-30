@@ -50,4 +50,7 @@ ticker_task :: proc(p: ^Process) {
     // Selective receive: unrelated mail may be queued ahead of the reply.
     reply := recv_tag(p, "value")
     kprint("ticker: final value = %d\n", message_value(reply, int))
+
+    // Nothing else will drive it, so release it.
+    send(p, counter, "quit")
 }

@@ -4,10 +4,17 @@
  * A trap arrives with sp still pointing at the *user* stack, so the first thing
  * trap_entry does is swap it with sscratch, which holds the kernel stack. The
  * whole integer register file is then saved into a TrapFrame, indexed by register
- * number so the Odin handler can read a7/a0/a1 by name.
+ * number so the Odin handler can read a7/a0/a1 by name, followed by sepc and
+ * sstatus.
+ *
+ * The kernel stack a user process traps onto is its own fiber stack, so the frame
+ * built here survives a syscall that blocks: the handler switches away mid-trap
+ * and the frame stays where it is until the scheduler resumes that process.
  */
 
-.equ TRAPFRAME_SIZE, 32*8
+.equ TRAPFRAME_SIZE, 34*8
+.equ FRAME_SEPC,     32*8
+.equ FRAME_SSTATUS,  33*8
 
 .section .text.trap_entry, "ax", @progbits
 .globl trap_entry
@@ -66,13 +73,26 @@ trap_entry:
     sd    x30, 30*8(sp)
     sd    x31, 31*8(sp)
 
+    /* t0 is already saved, so it is free to carry the CSRs into the frame. */
+    csrr  t0, sepc
+    sd    t0, FRAME_SEPC(sp)
+    csrr  t0, sstatus
+    sd    t0, FRAME_SSTATUS(sp)
+
     mv    a0, sp                    /* hand the frame to the handler */
     call  trap_handler
 
+    /* sepc and sstatus come back from the frame, not from the CSRs: a syscall
+     * that blocked let other processes run, and their own traps overwrote both.
+     * The handler adjusts the frame's copy of sepc, never the register. */
+    ld    t0, FRAME_SEPC(sp)
+    csrw  sepc, t0
+    ld    t0, FRAME_SSTATUS(sp)
+    csrw  sstatus, t0
+
     /* Leave sscratch holding what the mode we return to expects: the kernel
      * stack if user code is about to run, zero if we stay in the kernel. */
-    csrr  t0, sstatus
-    andi  t0, t0, (1 << 8)          /* SPP */
+    andi  t0, t0, (1 << 8)          /* SPP, as just restored */
     bnez  t0, .Lto_kernel
     addi  t0, sp, TRAPFRAME_SIZE
     csrw  sscratch, t0
@@ -117,11 +137,15 @@ trap_entry:
     .size trap_entry, . - trap_entry
 
 /*
- * void user_enter(u64 entry, u64 user_sp, Context *save)
+ * void user_enter(u64 entry, u64 user_sp)
  *
- * Save the kernel's callee-saved state so a later ctx_restore can resume this
- * caller, then drop to user mode at `entry`. Clearing sstatus.SPP is what makes
- * the sret land in U-mode rather than back in S-mode.
+ * Drop to user mode at `entry` on `user_sp`. Clearing sstatus.SPP is what makes
+ * the sret land in U-mode rather than back in S-mode, and sscratch takes the
+ * stack we are leaving -- the calling fiber's own -- for trap_entry to swap in.
+ *
+ * This never returns. Control comes back only as a trap, which resumes at the
+ * sret's own frame through trap_entry, and a process leaves user mode for good
+ * only by exiting, which switches to the scheduler instead.
  */
 .section .text.user_enter, "ax", @progbits
 .globl user_enter
@@ -129,21 +153,6 @@ trap_entry:
 .align 2
 
 user_enter:
-    sd   ra,   0*8(a2)
-    sd   sp,   1*8(a2)
-    sd   s0,   2*8(a2)
-    sd   s1,   3*8(a2)
-    sd   s2,   4*8(a2)
-    sd   s3,   5*8(a2)
-    sd   s4,   6*8(a2)
-    sd   s5,   7*8(a2)
-    sd   s6,   8*8(a2)
-    sd   s7,   9*8(a2)
-    sd   s8,  10*8(a2)
-    sd   s9,  11*8(a2)
-    sd   s10, 12*8(a2)
-    sd   s11, 13*8(a2)
-
     csrw sepc, a0                   /* sret resumes here, in user mode */
     li   t0, (1 << 8)
     csrc sstatus, t0                /* SPP = 0 -> return to user */
@@ -151,35 +160,6 @@ user_enter:
     mv   sp, a1                     /* user stack */
     sret
     .size user_enter, . - user_enter
-
-/*
- * void ctx_restore(Context *c)
- *
- * Resume a context saved by user_enter. Returns into that saved ra rather than
- * to its own caller, which is how a syscall abandons user mode for good.
- */
-.section .text.ctx_restore, "ax", @progbits
-.globl ctx_restore
-.type ctx_restore, @function
-.align 2
-
-ctx_restore:
-    ld   ra,   0*8(a0)
-    ld   sp,   1*8(a0)
-    ld   s0,   2*8(a0)
-    ld   s1,   3*8(a0)
-    ld   s2,   4*8(a0)
-    ld   s3,   5*8(a0)
-    ld   s4,   6*8(a0)
-    ld   s5,   7*8(a0)
-    ld   s6,   8*8(a0)
-    ld   s7,   9*8(a0)
-    ld   s8,  10*8(a0)
-    ld   s9,  11*8(a0)
-    ld   s10, 12*8(a0)
-    ld   s11, 13*8(a0)
-    ret
-    .size ctx_restore, . - ctx_restore
 
 /*
  * u64 do_syscall(u64 number, u64 arg0, u64 arg1)
@@ -206,16 +186,6 @@ do_syscall:
 .globl csr_read_scause
 csr_read_scause:
     csrr a0, scause
-    ret
-
-.globl csr_read_sepc
-csr_read_sepc:
-    csrr a0, sepc
-    ret
-
-.globl csr_write_sepc
-csr_write_sepc:
-    csrw sepc, a0
     ret
 
 .globl csr_read_stval

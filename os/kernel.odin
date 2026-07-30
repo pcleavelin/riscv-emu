@@ -51,64 +51,35 @@ _start :: proc() {
     boot(&k) // register the initial processes
     schedule(&k)
 
-    // The identity map is supervisor-only, so user code has nothing it may
-    // execute yet. Restoring this needs a per-process page table.
-    // kprint("kernel: dropping to user mode\n")
-    // run_user(rawptr(hello_user), make([]u8, 16 * 1024))
-
     for p in k.processes {
         if p.mailbox.dropped > 0 {
             kprint("kernel: process %d lost %d message(s) to overflow\n", p.id, p.mailbox.dropped)
         }
     }
     kprint("kernel: idle, shutting down\n")
-
-    address_space_demo()
-}
-
-// Show that a mapping belongs to an address space rather than to the machine.
-// The address used is the one an app image is linked at, so this also confirms
-// the low half is free now that the kernel has consolidated itself high.
-address_space_demo :: proc() {
-    space := create_address_space()
-
-    frame, err := mem.alloc(PAGE_SIZE, PAGE_SIZE, EMU_ALLOCATOR)
-    assert(err == nil, "out of memory")
-    map_page(space, abi.USER_TEXT_BASE, u64(uintptr(frame)), PTE_R | PTE_W | PTE_U)
-
-    satp_write_root(space)
-    private := (^u64)(uintptr(abi.USER_TEXT_BASE))
-
-    // The page is marked for user access, so the kernel needs the window open.
-    user_access_begin()
-    private^ = 0xC0FFEE
-    kprint("kernel: in the new space, 0x%x reads %x\n", u64(abi.USER_TEXT_BASE), private^)
-    user_access_end()
-
-    satp_write_root(kernel_root)
-    kprint("kernel: back in the kernel space, that address is gone\n")
-
-    // Reading it here raises a load page fault with stval = PRIVATE_VA, which is
-    // fatal in the kernel: there is no process to kill instead.
-    //   kprint("%x\n", private^)
 }
 
 // --- Process model -------------------------------------------------------------
 //
 // A process is an actor: it owns private memory and reaches other processes only
-// by message. Two kinds differ in who owns the loop:
+// by message. Three kinds differ in where they run and who owns the loop:
 //
-//   Service -- the kernel owns the loop and calls on_message per message. The
-//              process is stackless and runs to completion each turn, so state
-//              that outlives a message lives in `user_state`. Cheap; the default.
-//   Task    -- the process owns the loop, running on its own stack as a fiber.
-//              It can block mid-computation (recv) or step aside (yield), so its
-//              state lives in ordinary locals.
+//   Service -- in the kernel, stackless. The kernel owns the loop and calls
+//              on_message per message, so state that outlives a message lives in
+//              `user_state`. Cheap, and the right shape for a driver.
+//   Task    -- in the kernel, on its own stack as a fiber. It owns its loop, so it
+//              can block mid-computation (recv) or step aside (yield) and keep its
+//              state in ordinary locals.
+//   User    -- in user mode, in an address space of its own, loaded from its own
+//              ELF. It reaches the kernel only by syscall. On the kernel side it
+//              is a fiber too: the stack it traps onto is a fiber stack, which is
+//              what lets a syscall block exactly the way a task's recv does.
 //
 // Lifecycle: spawn -> Ready|Waiting -> (Ready <-> Waiting)* -> Dead.
-// A service spawns Waiting (nothing to do until a message arrives); a task spawns
-// Ready (it wants to run). A send into a Waiting process wakes it. A task that
-// returns from its entry proc becomes Dead and the kernel reclaims its memory.
+// A service spawns Waiting (nothing to do until a message arrives); a task and a
+// user process spawn Ready (they want to run). A send into a Waiting process wakes
+// it. A task that returns from its entry proc, or a user process that exits or
+// faults, becomes Dead and the kernel reclaims its memory.
 
 ProcessId :: distinct int
 
@@ -117,6 +88,7 @@ NO_PROCESS :: ProcessId(-1) // sender id for kernel-originated messages
 ProcessKind :: enum {
     Service,
     Task,
+    User,
 }
 
 ProcessState :: enum {
@@ -142,8 +114,13 @@ Message :: struct {
 // mechanism later; small inline messages are the microkernel norm.
 
 MAILBOX_CAPACITY :: 16
-MESSAGE_TAG_MAX :: 16
-MESSAGE_DATA_MAX :: 64
+
+// Taken from the ABI rather than restated, because both limits are enforced twice:
+// a user send is bounds-checked against the ABI's values and then asserted against
+// these. Two copies that drifted would turn a syscall a process is entitled to make
+// into a kernel assert.
+MESSAGE_TAG_MAX :: abi.TAG_MAX
+MESSAGE_DATA_MAX :: abi.DATA_MAX
 
 Slot :: struct {
     from:     ProcessId,
@@ -189,10 +166,18 @@ Process :: struct {
     on_message: MessageHandler,
     user_state: rawptr,
 
-    // Task: entry point, saved CPU state, and the stack the fiber runs on.
+    // Task and user: entry point, saved CPU state, and the stack the fiber runs
+    // on. For a user process that stack is the one it traps onto, so the trap
+    // frame of a blocked syscall lives there and nothing has to copy it aside.
     entry: TaskEntry,
     ctx:   Context,
     stack: []u8,
+
+    // User: the address space the process runs in, and where in it to start. The
+    // root table also tells the kernel which mappings a pointer from this process
+    // is allowed to name (see user_range_ok).
+    root:     ^PageTable,
+    entry_pc: u64,
 
     // Every process owns its mailbox and the memory behind it: delivery copies
     // the message into the *receiver's* slots, so a process holds no pointer into
@@ -213,11 +198,16 @@ Process :: struct {
 
 Kernel :: struct {
     processes: [dynamic]^Process,
-    current:   ^Process,
 
     // The scheduler's own CPU state. A task switches here to give up the CPU.
     sched_ctx: Context,
 }
+
+// The process the scheduler is currently running, or nil between turns. A trap
+// arrives carrying nothing but a register frame, so the handler needs somewhere to
+// look up whose syscall it is servicing and whose address space to validate
+// pointers against.
+current_process: ^Process
 
 // A task's stack is carved from its own arena, so the arena must be comfortably
 // larger than the stack -- what is left is the room its mailbox and state grow
@@ -278,8 +268,7 @@ spawn_service :: proc(
 }
 
 // Register an active task: `entry` runs on its own stack and owns its loop.
-// Starts Ready. The context is seeded so the first switch into it "returns" into
-// fiber_trampoline with s0 holding the process pointer.
+// Starts Ready.
 spawn_task :: proc(
     k: ^Kernel,
     entry: TaskEntry,
@@ -288,15 +277,61 @@ spawn_task :: proc(
     p := process_init(k, .Task, backpressure)
     p.entry = entry
     p.state = .Ready
+    fiber_init(p)
+    return p.id
+}
 
+// Start a user process from an application image: load it into an address space of
+// its own, then give it a fiber whose whole job is to drop into user mode. Failure
+// is the image not being loadable, and it costs nothing -- no process is
+// registered. Starts Ready.
+spawn_user :: proc(
+    k: ^Kernel,
+    image: string,
+    backpressure := Backpressure.RejectNewest,
+) -> (ProcessId, bool) {
+    img, loaded := load_image(image)
+    if !loaded do return NO_PROCESS, false
+
+    p := process_init(k, .User, backpressure)
+    p.entry = user_main
+    p.entry_pc = img.entry
+    p.root = img.root
+    p.state = .Ready
+    fiber_init(p)
+
+    kprint("kernel: process %d is '%s', entry %x\n", p.id, image, img.entry)
+    return p.id, true
+}
+
+// Give a process the stack it runs on and seed its context so the first switch
+// into it "returns" into fiber_trampoline with s0 holding the process pointer.
+@(private)
+fiber_init :: proc(p: ^Process) {
     p.stack = make([]u8, TASK_STACK_SIZE, p.allocator)
 
     stack_top := uintptr(raw_data(p.stack)) + uintptr(len(p.stack))
     p.ctx.sp = u64(stack_top &~ uintptr(15)) // the ABI wants a 16-byte aligned sp
     p.ctx.ra = u64(uintptr(rawptr(fiber_trampoline)))
     p.ctx.s[0] = u64(uintptr(p))
+}
 
-    return p.id
+// The kernel side of a user process. Dropping to user mode never returns: from
+// here on the process is reached only through trap_entry, and it leaves only by
+// exiting or faulting, both of which switch to the scheduler instead of returning.
+@(private)
+user_main :: proc(p: ^Process) {
+    user_enter(p.entry_pc, abi.USER_STACK_TOP)
+}
+
+// End the running process and go back to the scheduler for good. Its arena, the
+// stack it ran on and the trap frame sitting on that stack all die together, so
+// there is nothing to return to.
+@(private)
+exit_current :: proc(p: ^Process) -> ! {
+    p.state = .Dead
+    ctx_switch(&p.ctx, &p.kernel.sched_ctx)
+    unreachable()
 }
 
 // --- Messaging -----------------------------------------------------------------
@@ -388,20 +423,27 @@ mailbox_pop :: proc(p: ^Process) -> (msg: Message, ok: bool) {
     }, true
 }
 
-// --- Task-only primitives ------------------------------------------------------
-// These suspend the caller, so only a fiber task may use them. A service is
-// stackless and must return instead of blocking.
+// --- Suspending primitives -----------------------------------------------------
+// These suspend the caller, so only a process that owns a stack may use them: a
+// task, or a user process inside a syscall. A service is stackless and must return
+// instead of blocking.
+
+// Does this process own a stack it can be suspended on top of?
+@(private)
+owns_stack :: proc(p: ^Process) -> bool {
+    return p.kind == .Task || p.kind == .User
+}
 
 // Give up the CPU but stay runnable.
 yield :: proc(p: ^Process) {
-    assert(p.kind == .Task, "yield is only valid inside a task")
+    assert(owns_stack(p), "yield needs a stack to suspend on")
     p.state = .Ready
     ctx_switch(&p.ctx, &p.kernel.sched_ctx)
 }
 
 // Block until a message arrives, then take it.
 recv :: proc(p: ^Process) -> Message {
-    assert(p.kind == .Task, "recv is only valid inside a task")
+    assert(owns_stack(p), "recv needs a stack to suspend on")
     for p.mailbox.count == 0 {
         p.state = .Waiting
         ctx_switch(&p.ctx, &p.kernel.sched_ctx)
@@ -429,8 +471,8 @@ recv_tag :: proc(p: ^Process, tag: string) -> Message {
 // --- Scheduler -----------------------------------------------------------------
 
 // Round-robin over the runnable processes until the system goes idle -- that is,
-// until nothing is Ready. A service gets one message per turn; a task runs until
-// it yields, blocks, or exits.
+// until nothing is Ready. A service gets one message per turn; a task or a user
+// process runs until it yields, blocks, or exits.
 schedule :: proc(k: ^Kernel) {
     for {
         ran_something := false
@@ -439,7 +481,7 @@ schedule :: proc(k: ^Kernel) {
             if p.state != .Ready do continue
 
             ran_something = true
-            k.current = p
+            current_process = p
 
             switch p.kind {
             case .Service:
@@ -451,12 +493,21 @@ schedule :: proc(k: ^Kernel) {
                     p.state = .Waiting
                 }
 
-            case .Task:
+            case .Task, .User:
+                // A user process runs on its own address space, and the kernel
+                // must be on it too while servicing that process: the trap handler
+                // does not change satp, and copying to and from user memory only
+                // resolves in the process's own map. Every address space contains
+                // the kernel, so switching from here is safe.
+                if p.kind == .User do satp_write_root(p.root)
+
                 ctx_switch(&k.sched_ctx, &p.ctx)
+
+                if p.kind == .User do satp_write_root(kernel_root)
                 if p.state == .Dead do process_free(p)
             }
 
-            k.current = nil
+            current_process = nil
         }
 
         if !ran_something do return
@@ -466,6 +517,10 @@ schedule :: proc(k: ^Kernel) {
 // Release everything a dead process owns in one shot. The mailbox is inline
 // storage that dies with the process; the stack and anything it allocated live
 // in its arena.
+//
+// A user process's page tables and frames are not reclaimed yet. They come from
+// the kernel heap rather than the arena, so freeing them needs the address space
+// walked and every frame handed back.
 @(private)
 process_free :: proc(p: ^Process) {
     free_all(p.allocator)
