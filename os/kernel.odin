@@ -105,9 +105,10 @@ MessageHandler :: proc(p: ^Process, msg: Message)
 TaskEntry :: proc(p: ^Process)
 
 Message :: struct {
-    from: ProcessId,
-    tag:  string, // message kind, e.g. "inc"
-    data: []u8,   // payload bytes, owned by the receiving process
+    from:  ProcessId,
+    tag:   string,  // message kind, e.g. "inc"
+    data:  []u8,    // payload bytes, owned by the receiving process
+    grant: GrantId, // NO_GRANT, or memory this message handed over
 }
 
 // --- Mailbox -------------------------------------------------------------------
@@ -130,6 +131,7 @@ Slot :: struct {
     from:     ProcessId,
     tag_len:  int,
     data_len: int,
+    grant:    GrantId,
     tag_buf:  [MESSAGE_TAG_MAX]u8,
     data_buf: [MESSAGE_DATA_MAX]u8,
 }
@@ -182,6 +184,10 @@ Process :: struct {
     // is allowed to name (see user_range_ok).
     root:     ^PageTable,
     entry_pc: u64,
+
+    // Which grant occupies each slot of the process's grant region, or NO_GRANT.
+    // Bounding this bounds how much of an address space grants can claim.
+    grant_slots: [abi.GRANT_SLOTS]GrantId,
 
     // Every process owns its mailbox and the memory behind it: delivery copies
     // the message into the *receiver's* slots, so a process holds no pointer into
@@ -250,6 +256,11 @@ process_init :: proc(k: ^Kernel, kind: ProcessKind, backpressure: Backpressure) 
     backing, _ := runtime.mem_alloc_non_zeroed(PROCESS_ARENA_SIZE, allocator = EMU_ALLOCATOR)
     mem.arena_init(&p.arena, backing)
     p.allocator = mem.arena_allocator(&p.arena)
+
+    // Zero is a valid grant id, so an empty slot has to say so explicitly.
+    for i in 0 ..< abi.GRANT_SLOTS {
+        p.grant_slots[i] = NO_GRANT
+    }
 
     append(&k.processes, p)
     return p
@@ -343,7 +354,13 @@ exit_current :: proc(p: ^Process) -> ! {
 // Copy a message into the receiver's mailbox. Returns false when it could not be
 // delivered -- unknown or dead target, or a full mailbox under RejectNewest.
 @(private)
-deliver :: proc(k: ^Kernel, from, to: ProcessId, tag: string, data: []u8) -> bool {
+deliver :: proc(
+    k: ^Kernel,
+    from, to: ProcessId,
+    tag: string,
+    data: []u8,
+    grant := NO_GRANT,
+) -> bool {
     if int(to) < 0 || int(to) >= len(k.processes) do return false
 
     target := k.processes[int(to)]
@@ -372,6 +389,7 @@ deliver :: proc(k: ^Kernel, from, to: ProcessId, tag: string, data: []u8) -> boo
     slot.from = from
     slot.tag_len = len(tag)
     slot.data_len = len(data)
+    slot.grant = grant
     copy(slot.tag_buf[:], transmute([]u8)tag)
     copy(slot.data_buf[:], data)
     mb.count += 1
@@ -424,6 +442,7 @@ mailbox_pop :: proc(p: ^Process) -> (msg: Message, ok: bool) {
         from = p.staging.from,
         tag = string(p.staging.tag_buf[:p.staging.tag_len]),
         data = p.staging.data_buf[:p.staging.data_len],
+        grant = p.staging.grant,
     }, true
 }
 
@@ -530,6 +549,11 @@ process_free :: proc(p: ^Process) {
     free_all(p.allocator)
     p.mailbox = {}
     p.stack = nil
+
+    // Grants first. A mapped grant's frames are reachable both through the page
+    // table and through the grant, so freeing the address space first would give
+    // them back by one route while the grant still named them by the other.
+    grants_release(p)
 
     if p.root != nil {
         free_address_space(p.root)

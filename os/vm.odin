@@ -218,6 +218,31 @@ map_page :: proc(root: ^PageTable, vaddr: u64, paddr: u64, flags: u64) {
     table[(vaddr >> 12) & 0x1FF] = leaf_pte(paddr, flags)
 }
 
+// Remove the mapping for `vaddr` and report the frame it named. The frame itself
+// is untouched, because the caller may be moving it to another address space
+// rather than giving it back.
+//
+// The tables that led to it stay: a process that unmaps one page has usually not
+// finished with that region, and free_address_space collects them in the end.
+unmap_page :: proc(root: ^PageTable, vaddr: u64) -> (paddr: u64, ok: bool) {
+    table := root
+
+    for level := 2; level > 0; level -= 1 {
+        entry := table[(vaddr >> uint(12 + 9*level)) & 0x1FF]
+        if (entry & PTE_V) == 0 do return 0, false
+        if entry & (PTE_R | PTE_W | PTE_X) != 0 do return 0, false // a superpage
+
+        table = cast(^PageTable)uintptr((entry >> 10) << 12)
+    }
+
+    index := (vaddr >> 12) & 0x1FF
+    entry := table[index]
+    if (entry & PTE_V) == 0 do return 0, false
+
+    table[index] = 0
+    return (entry >> 10) << 12, true
+}
+
 // Find the leaf entry that maps `vaddr`, or report that nothing does. A leaf can
 // turn up above the bottom level as a superpage, which is why this descends
 // looking for permission bits rather than simply indexing three times.

@@ -16,9 +16,20 @@ ProcessId :: distinct int
 
 NO_PROCESS :: ProcessId(-1)
 
+GrantId :: distinct int
+
+NO_GRANT :: GrantId(abi.NO_GRANT)
+
 Message :: struct {
-    from: ProcessId,
-    tag:  string,
+    from:  ProcessId,
+    tag:   string,
+    data:  []u8,
+    grant: GrantId, // NO_GRANT, or memory this message handed to us
+}
+
+// A block of memory that belongs to this process until it sends or drops it.
+Grant :: struct {
+    id:   GrantId,
     data: []u8,
 }
 
@@ -57,12 +68,28 @@ self :: proc() -> ProcessId {
 // target's mailbox is full, which is the cue to retry or back off rather than
 // assume the message arrived.
 send :: proc(to: ProcessId, tag: string, data: []u8 = nil) -> bool {
+    return send_full(to, tag, data, NO_GRANT)
+}
+
+// Send, handing a block of memory over with the message. The grant stops being
+// ours the moment this succeeds -- reading or writing `g.data` afterwards is a
+// page fault, not a stale read, because the memory moves rather than being shared.
+//
+// A false return means nothing moved: the grant is still ours, still mapped where
+// it was, so backing off and retrying is safe.
+send_grant :: proc(to: ProcessId, tag: string, g: Grant, data: []u8 = nil) -> bool {
+    return send_full(to, tag, data, g.id)
+}
+
+@(private)
+send_full :: proc(to: ProcessId, tag: string, data: []u8, grant: GrantId) -> bool {
     assert(len(tag) <= abi.TAG_MAX, "message tag too long")
     assert(len(data) <= abi.DATA_MAX, "payload too large for a message; use a grant")
 
     buf: abi.MessageBuf
     buf.tag_len = i64(len(tag))
     buf.data_len = i64(len(data))
+    buf.grant = i64(grant)
     copy(buf.tag[:], transmute([]u8)tag)
     copy(buf.data[:], data)
 
@@ -114,6 +141,48 @@ message_from_buf :: proc(buf: ^abi.MessageBuf) -> Message {
         from = ProcessId(buf.from),
         tag = string(buf.tag[:buf.tag_len]),
         data = buf.data[:buf.data_len],
+        grant = GrantId(buf.grant),
+    }
+}
+
+// --- Grants --------------------------------------------------------------------
+//
+// A grant is how a buffer too big for a message travels: the kernel maps it into
+// whoever owns it, and ownership moves on a send. Exactly one process can reach
+// one at a time, so there is nothing to lock and no way for two processes to
+// disagree about what it holds.
+
+// Ask for `size` bytes of our own. The memory arrives zeroed and mapped, at an
+// address the kernel picks.
+grant_create :: proc(size: int) -> (Grant, bool) {
+    info: abi.GrantInfo
+    if do_syscall(abi.SYS_GRANT_CREATE, u64(size), u64(uintptr(&info))) != abi.OK {
+        return {}, false
+    }
+    return grant_from_info(&info), true
+}
+
+// Take up a grant that arrived on a message. It is already ours at this point;
+// this is what gives it an address in our address space.
+grant_map :: proc(id: GrantId) -> (Grant, bool) {
+    info: abi.GrantInfo
+    if do_syscall(abi.SYS_GRANT_MAP, u64(id), u64(uintptr(&info))) != abi.OK {
+        return {}, false
+    }
+    return grant_from_info(&info), true
+}
+
+// Give a grant up. Its memory goes back to the kernel, so `g.data` must not be
+// touched again.
+grant_drop :: proc(g: Grant) {
+    do_syscall(abi.SYS_GRANT_DROP, u64(g.id), 0)
+}
+
+@(private)
+grant_from_info :: proc(info: ^abi.GrantInfo) -> Grant {
+    return Grant {
+        id = GrantId(info.id),
+        data = (([^]u8)(uintptr(info.addr)))[:info.size],
     }
 }
 

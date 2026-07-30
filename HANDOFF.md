@@ -94,6 +94,7 @@ Commits, oldest first:
 | `switch.S` | `ctx_switch` for fibers |
 | `sbi.odin`, `sbi.S` | supervisor ecalls out to the host; fetching app images |
 | `loader.odin` | ELF64 loader: an image becomes an address space |
+| `grant.odin` | memory grants: blocks that move between processes |
 | `boot.odin` | which processes the system starts with, and on which side |
 | `app_counter.odin`, `app_ticker.odin` | in-kernel example processes |
 
@@ -128,6 +129,26 @@ does not change `satp` and `copy_*_user` only resolves in the process's own map.
 free. Overflow policy is per-process: `RejectNewest` is the default and reports
 the refusal so a sender can retry; `DropOldest` is opt-in for state and telemetry.
 Losses are counted and reported, never silent.
+
+**Grants** (`os/grant.odin`) are how anything bigger than 64 bytes travels. A grant
+is a block of memory that **moves**: the sender allocates it, fills it, sends it,
+and at that moment stops being able to reach it. Exactly one process can touch a
+grant at any time, so the actor model's promise holds for bulk data too — nothing
+to lock, nothing to race, and a sender that keeps using the buffer takes a page
+fault instead of silently corrupting the receiver's view.
+
+The mechanics: a grant owns a list of frames (not necessarily contiguous — the
+pool hands out single frames). Transfer unmaps them from the sender and marks the
+receiver as owner; the receiver calls `grant_map` to get an address. Slots in the
+`0x3000_0000` region are the kernel's to hand out, so neither side negotiates an
+address, and both usually see it at the same one. A send checks the transfer can
+work *before* queueing and commits only once delivery is certain, so a refused
+send leaves the sender still holding the memory, mapped where it was — retry is
+safe.
+
+Grants are user-to-user. A kernel-resident process has no page table to map one
+into, and its frames are not contiguous in the identity map, so `grant_transfer`
+refuses. A kernel-side compositor would need a mapping window above `KERNEL_BASE`.
 
 **Kernel memory map** (constants in `os/vm.odin`):
 
@@ -199,6 +220,7 @@ The user address space, from `sdk/abi`:
 ```
 0x0001_0000  image        text, rodata, data, bss
 0x2000_0000  heap         1MB, the SDK's arena
+0x3000_0000  grants       8 slots of 1MB, mapped as grants arrive
 0x4000_0000  stack top    64K, grows down
 ```
 
@@ -276,18 +298,30 @@ Measured on the standard boot: **347 frames at peak, 1 in use at the end** — t
 being `kernel_root`. The 346 reclaimed are exactly what the user process owned: 69
 for the image, 256 for its 1MB heap, 16 for its 64K stack, and 5 page tables.
 
+**Grants work.** `apps/pixels` is one image started twice: one process paints a
+64×64×4 frame (16K, so 256× the inline message limit) into a grant and sends it,
+the other maps it and checks every pixel. The painter *exits before* the display
+reads the buffer and all 4096 pixels are still correct, which is the proof that
+the memory moved rather than being copied out of a still-live address space.
+
+Verified by temporarily writing to the buffer after the handover: the painter took
+`cause=15 stval=30000000` and was killed alone, the display still got the frame
+intact, and the frame accounting still balanced — the painter died while the
+*display* owned the grant, so `grants_release` had to skip a grant it no longer
+owned and `free_address_space` had to not collect the transferred frames.
+
 ## What to do next
 
 Nothing is blocked. In rough order of value:
 
-1. **Memory grants**, so a process can hand over a buffer larger than a message.
-   The GUI needs them and nothing else will do.
+1. **Preemption.** Scheduling is cooperative, so a user process that never makes a
+   syscall never gives up the CPU. Nothing generates timer interrupts yet.
 2. **A leaner logging path.** The counter app's text is ~240KB, nearly all Odin
    runtime pulled in by `fmt`.
-3. **Preemption.** Scheduling is cooperative, so a user process that never makes a
-   syscall never gives up the CPU. Nothing generates timer interrupts yet.
-4. **Process supervision**, which is where the mailbox-deadlock question below
+3. **Process supervision**, which is where the mailbox-deadlock question below
    wants to be settled.
+4. **A kernel-side grant window**, if the GUI compositor ends up kernel-resident.
+   Grants are user-to-user today for the reason given above.
 
 ## Hard-won knowledge
 
@@ -352,9 +386,13 @@ Things that cost real debugging time. Do not rediscover them.
   message the system already accepted and makes failure actionable at the sender.
   Blocking sends were rejected as a default: a service is stackless and physically
   cannot block, and blocking invites deadlock between two full mailboxes.
-- **Messages stay small and inline.** Anything larger than 64 bytes will use a
-  future shared-memory grant, not a bigger mailbox. This matters for the GUI,
-  which will want to hand over pixel buffers.
+- **Messages stay small and inline.** Anything larger than 64 bytes travels as a
+  grant, not in a bigger mailbox.
+- **A grant moves rather than being shared.** Chosen over shared mapping because it
+  keeps the actor model's no-shared-mutable-state invariant, which is what makes
+  message passing worth building on: no locks, no races, and misuse faults instead
+  of corrupting. Sharing can be added later as a second mode, once a compositor
+  exists to say what it actually needs.
 - **App ELF bytes come from an SBI hypercall**, not an embedded archive.
 - **A user process is hosted by a kernel fiber**, rather than the kernel keeping a
   saved trap frame per process and re-entering user mode from the scheduler. It
@@ -366,8 +404,10 @@ Things that cost real debugging time. Do not rediscover them.
 
 ## Open questions
 
-- **Memory grants** are decided in principle and not designed at all. The GUI
-  needs them.
+- **Grants are one-shot handovers, not shared buffers.** A client that redraws the
+  same buffer every frame has to be re-granted it each time, which costs a round
+  trip. Whether that matters is a question for a real compositor; adding a shared
+  mode later means adding a synchronization story the kernel does not have.
 - **Bounded mailboxes plus blocking retry loops can deadlock** if two processes
   fill each other's mailboxes. Inherent to reject-newest; normally handled with
   timeouts or supervision. Worth settling when process supervision is designed.

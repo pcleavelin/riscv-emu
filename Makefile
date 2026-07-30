@@ -13,9 +13,11 @@ emu_os:
 emu_apps:
 	mkdir -p apps/bin
 	-rm apps/bin/*.o apps/bin/*.elf
-	odin build apps/counter -target:freestanding_riscv64 -build-mode:object -default-to-nil-allocator -no-thread-local -no-rpath -no-crt -o:none -out:apps/bin/counter.o
 	riscv64-none-elf-gcc -c sdk/app/syscall.S -ffreestanding -o apps/bin/syscall.o
+	odin build apps/counter -target:freestanding_riscv64 -build-mode:object -default-to-nil-allocator -no-thread-local -no-rpath -no-crt -o:none -out:apps/bin/counter.o
 	riscv64-none-elf-ld -T sdk/app/link.ld apps/bin/counter-* apps/bin/syscall.o -o apps/bin/counter.elf
+	odin build apps/pixels -target:freestanding_riscv64 -build-mode:object -default-to-nil-allocator -no-thread-local -no-rpath -no-crt -o:none -out:apps/bin/pixels.o
+	riscv64-none-elf-ld -T sdk/app/link.ld apps/bin/pixels-* apps/bin/syscall.o -o apps/bin/pixels.elf
 
 examples: emu-hello-example emu-host-to-guest-example
 

@@ -146,10 +146,25 @@ user_syscall :: proc(p: ^Process, number, arg0, arg1: u64) -> i64 {
 
         to := ProcessId(i64(arg0))
         if int(to) < 0 || int(to) >= len(p.kernel.processes) do return abi.ERR_NO_PROC
-        if p.kernel.processes[int(to)].state == .Dead do return abi.ERR_NO_PROC
+        target := p.kernel.processes[int(to)]
+        if target.state == .Dead do return abi.ERR_NO_PROC
+
+        // Check the grant before queueing, so a send that cannot hand its memory
+        // over fails without delivering a message that promises memory the
+        // receiver will never get.
+        grant := NO_GRANT
+        if msg.grant != abi.NO_GRANT {
+            grant = GrantId(msg.grant)
+            if err := grant_transfer_check(grant, p, target); err != abi.OK do return err
+        }
 
         tag := string(msg.tag[:msg.tag_len])
-        if !deliver(p.kernel, p.id, to, tag, msg.data[:msg.data_len]) do return abi.ERR_FULL
+        if !deliver(p.kernel, p.id, to, tag, msg.data[:msg.data_len], grant) do return abi.ERR_FULL
+
+        // Only now, with the message certain to arrive, does the memory change
+        // hands. A refused send leaves the sender still holding it, still mapped
+        // at the same address, so backing off and retrying is safe.
+        if grant != NO_GRANT do grant_transfer(grant, p, target)
         return abi.OK
 
     case abi.SYS_RECV:
@@ -164,6 +179,28 @@ user_syscall :: proc(p: ^Process, number, arg0, arg1: u64) -> i64 {
         if !ok do return abi.ERR_EMPTY
         if !message_to_user(p, arg0, msg) do return abi.ERR_FAULT
         return abi.OK
+
+    case abi.SYS_GRANT_CREATE:
+        info, err := grant_create(p, arg0)
+        if err != abi.OK do return err
+        if !copy_to_user(p, arg1, slice.bytes_from_ptr(&info, size_of(abi.GrantInfo))) {
+            // The process cannot be told where its memory landed, so it could
+            // never use or release it. Undo rather than leak.
+            grant_drop(p, GrantId(info.id))
+            return abi.ERR_FAULT
+        }
+        return abi.OK
+
+    case abi.SYS_GRANT_MAP:
+        info, err := grant_map(p, GrantId(i64(arg0)))
+        if err != abi.OK do return err
+        if !copy_to_user(p, arg1, slice.bytes_from_ptr(&info, size_of(abi.GrantInfo))) {
+            return abi.ERR_FAULT
+        }
+        return abi.OK
+
+    case abi.SYS_GRANT_DROP:
+        return grant_drop(p, GrantId(i64(arg0)))
 
     case abi.SYS_SPAWN:
         name: [IMAGE_NAME_MAX]u8
@@ -188,6 +225,7 @@ message_to_user :: proc(p: ^Process, dest: u64, msg: Message) -> bool {
     buf.from = i64(msg.from)
     buf.tag_len = i64(len(msg.tag))
     buf.data_len = i64(len(msg.data))
+    buf.grant = i64(msg.grant)
     copy(buf.tag[:], transmute([]u8)msg.tag)
     copy(buf.data[:], msg.data)
 
